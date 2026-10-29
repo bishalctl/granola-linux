@@ -16,8 +16,8 @@ the image from Granola, and you sign in with your own account.
 
 ## Install
 
-Requirements: x86-64 Linux, `curl`, `python3`, `node` and `npm`, `make`, and
-`g++` 11 or newer. Reading the disk image needs 7-Zip 21.02 or newer (the
+Requirements: x86-64 Linux, `curl`, `python3` 3.8 or newer, `node` 24 and
+`npm`, `make`, and `g++` 11 or newer. Reading the disk image needs 7-Zip 21.02 or newer (the
 `7zip` package on Arch, Debian 13 and Ubuntu 24.04 or later). Without one,
 the script fetches the static build from 7-zip.org and checks it against a
 checksum pinned in the script. The `p7zip` most distributions still ship
@@ -67,7 +67,7 @@ Some things are different from the macOS build:
   turns on Chromium's PipeWire capturer and the app records what the desktop
   portal offers it.
 - Granola's auto-update is off. The installed version is pinned; `make
-  status` tells you when a new release is out and `make install` brings it
+status` tells you when a new release is out and `make install` brings it
   in.
 - Features that call macOS frameworks directly, such as the Apple Calendar
   integration, do not exist on Linux. Google and Microsoft calendars are
