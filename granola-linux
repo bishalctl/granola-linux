@@ -213,9 +213,10 @@ cmd_install() {
   step "Checking prerequisites"
   local c
   for c in curl node npm python3 make tar sha256sum; do need_cmd "$c"; done
-  # node-gyp's gyp uses the walrus operator, a syntax error before Python 3.8.
-  python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' \
-    || die "python3 is $(python3 -V 2>&1), node-gyp needs 3.8 or newer (check your PATH, e.g. an old conda base)"
+  # The gyp bundled with $NODE_GYP declares requires-python >=3.9; older
+  # versions fail inside the build with a SyntaxError that names no version.
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
+    || die "python3 is $(python3 -V 2>&1), node-gyp needs 3.9 or newer (check which python3 is first on your PATH)"
   mkdir -p "$CACHE_DIR"
   SEVENZIP=$(find_sevenzip)
   find_compiler
