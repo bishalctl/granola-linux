@@ -519,7 +519,41 @@ EOF
 emit_linux_runtime() {
   cat <<'EOF'
 'use strict';
-const {spawn, execFile} = require('node:child_process');
+const {spawn, execFile, execFileSync} = require('node:child_process');
+
+// On Hyprland, setBounds() changes Electron's viewport even when the compositor
+// keeps a tiled window at its assigned size. Granola calls it on view changes,
+// leaving a 1200x840 page inside a larger tile until the next focus configure.
+// Let the compositor own mapped tiles; retain native sizing for floating
+// windows, XWayland, other desktops and every secondary/notification window.
+const managedPrimaryWindows = new WeakSet();
+function managePrimaryWindow(window, {platform = process.platform, env = process.env,
+    pid = process.pid, query = () => execFileSync('hyprctl', ['-j', 'clients'],
+      {encoding: 'utf8', timeout: 500, maxBuffer: 8 * 1024 * 1024,
+       stdio: ['ignore', 'pipe', 'ignore']})} = {}) {
+  if (!window || managedPrimaryWindows.has(window) || platform !== 'linux' ||
+      !env.WAYLAND_DISPLAY || !env.HYPRLAND_INSTANCE_SIGNATURE) return;
+  managedPrimaryWindows.add(window);
+  const tiled = () => {
+    try {
+      return JSON.parse(query()).some(client => client.pid === pid &&
+        client.title === window.getTitle() && client.mapped && !client.hidden &&
+        !client.floating && !client.xwayland);
+    } catch { /* An unavailable compositor must not break ordinary window APIs. */ }
+    return false;
+  };
+  const setBounds = window.setBounds, unmaximize = window.unmaximize;
+  window.setBounds = function (...args) {
+    if (!tiled()) return setBounds.apply(this, args);
+  };
+  // Chromium can report a tiled Wayland window as maximized. Granola first
+  // unmaximizes it, which independently restores old geometry/insets even
+  // when the following setBounds is ignored. Keep both operations native
+  // for floating windows, and leave show/focus/hide APIs untouched.
+  window.unmaximize = function (...args) {
+    if (!tiled()) return unmaximize.apply(this, args);
+  };
+}
 
 function execute(command, args) {
   return new Promise((resolve, reject) => execFile(command, args,
@@ -705,7 +739,7 @@ async function microphonePermission(callback) {
   try { await execute('pactl', ['info']); callback(true); }
   catch { callback(false); }
 }
-module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission};
+module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow};
 EOF
 }
 
@@ -738,11 +772,13 @@ if marker not in source:
     audio = re.compile(r'function (?P<send>[\w$]+)\((?P<arg>[\w$]+)\)\{(?P<broadcast>[\w$]+)\(`to-audio-process`,(?P=arg)\)\}function (?P<receive>[\w$]+)\(')
     permission = re.compile(r'async function (?P<name>[\w$]+)\((?P<cb>[\w$]+)\)\{(?P=cb)\(await (?P<electron>[\w$]+)\.systemPreferences\.askForMediaAccess\(`microphone`\)\)\}')
     monitor = re.compile(r'function (?P<name>[\w$]+)\(\)\{return process\.platform===`darwin`\?(?P<mac>[^{};]+):process\.platform===`win32`\?(?P<win>[\w$]+):(?P<cb>[\w$]+)=>\((?P=cb)\(\[\]\),\(\)=>\{\}\)\}')
-    if any(len(list(pattern.finditer(source))) != 1 for pattern in (audio, permission, monitor)):
-        raise SystemExit('Granola audio/meeting observer changed; review before updating this app version')
+    primary = re.compile(r'let (?P<win>[\w$]+)=[\w$]+;(?P=win)&&(?P=win)\.on\(`close`,')
+    if any(len(list(pattern.finditer(source))) != 1 for pattern in (audio, permission, monitor, primary)):
+        raise SystemExit('Granola audio/meeting/primary-window setup changed; review before updating this app version')
     source = audio.sub(lambda m: f'function {m["send"]}({m["arg"]}){{if(process.platform===`linux`)return {runtime}.handle({m["arg"]},{m["receive"]});{m["broadcast"]}(`to-audio-process`,{m["arg"]})}}function {m["receive"]}(', source)
     source = permission.sub(lambda m: f'async function {m["name"]}({m["cb"]}){{if(process.platform===`linux`)return {runtime}.microphonePermission({m["cb"]});{m["cb"]}(await {m["electron"]}.systemPreferences.askForMediaAccess(`microphone`))}}', source)
     source = monitor.sub(lambda m: f'function {m["name"]}(){{if(process.platform===`linux`)return {runtime}.subscribeMeetings;return process.platform===`darwin`?{m["mac"]}:process.platform===`win32`?{m["win"]}:{m["cb"]}=>({m["cb"]}([]),()=>{{}})}}', source)
+    source = primary.sub(lambda m: m[0].replace(f';{m["win"]}&&', f';if(process.platform===`linux`){runtime}.managePrimaryWindow({m["win"]});{m["win"]}&&'), source)
     replacement = (source + f'\n/*{marker}*/\n').encode()
     # Rebuild offsets and changed-file integrity rather than overwriting bytes
     # past an ASAR entry. Every other packed file is copied byte for byte.
@@ -929,7 +965,7 @@ cmd_check_runtime() (
   node - "$test_dir/runtime.cjs" <<'EOF'
 const assert = require('node:assert/strict');
 const {EventEmitter} = require('node:events');
-const {createCapture, parseMeetingApps, subscribeMeetings} = require(process.argv[2]);
+const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow} = require(process.argv[2]);
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function setup(command) {
   const children = [], events = [], timers = [];
@@ -953,6 +989,39 @@ function setup(command) {
   return {capture, children, events, timers, get cancelled() { return cancelled; }};
 }
 (async () => {
+  const nativeBounds = [];
+  let unmaximized = 0;
+  const primary = {getTitle: () => 'Granola', unmaximize() { unmaximized++; }, setBounds(...args) {
+    assert.equal(this, primary); nativeBounds.push(args);
+  }};
+  let clients = [{pid: 42, title: 'Granola', mapped: true, floating: false, xwayland: false}];
+  const options = {platform: 'linux', env: {WAYLAND_DISPLAY: 'test', HYPRLAND_INSTANCE_SIGNATURE: 'test'},
+    pid: 42, query: () => JSON.stringify(clients)};
+  managePrimaryWindow(primary, options);
+  const guarded = primary.setBounds;
+  managePrimaryWindow(primary, options);
+  assert.equal(primary.setBounds, guarded, 'primary window wrapped twice');
+  primary.setBounds({width: 1200, height: 840}, true);
+  primary.unmaximize();
+  assert.equal(nativeBounds.length, 0, 'view transition resized a compositor-managed tile');
+  assert.equal(unmaximized, 0, 'tiled window was restored to old geometry');
+  for (const override of [{floating: true}, {xwayland: true}, {pid: 43}, {mapped: false}, {title: 'Notification'}]) {
+    clients = [{pid: 42, title: 'Granola', mapped: true, floating: false, xwayland: false, ...override}];
+    primary.setBounds({width: 700, height: 600}, true);
+    primary.unmaximize();
+  }
+  assert.equal(nativeBounds.length, 5, 'normal window resizing was blocked');
+  assert.equal(unmaximized, 5, 'ordinary unmaximize requests were blocked');
+  assert.deepEqual(nativeBounds[0], [{width: 700, height: 600}, true]);
+  clients = null;
+  primary.setBounds({width: 800});
+  assert.equal(nativeBounds.length, 6, 'compositor query failure broke native sizing');
+  for (const override of [{platform: 'darwin'}, {platform: 'win32'}, {env: {}}, {env: {WAYLAND_DISPLAY: 'test'}}]) {
+    const other = {setBounds() {}};
+    const original = other.setBounds;
+    managePrimaryWindow(other, {...options, ...override});
+    assert.equal(other.setBounds, original, 'unrelated desktop window API changed');
+  }
   const t = setup();
   assert.equal(t.children.length, 0, 'loading the module activated audio');
   await t.capture.start(16000);
@@ -1021,7 +1090,7 @@ function setup(command) {
   unsubscribe();
   await tick();
   assert(stopTimer && updates.length === 1, 'unsubscribe left detection active');
-  console.log('Linux runtime: PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
+  console.log('Linux runtime: tiled geometry, floating window APIs, PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 EOF
 )
