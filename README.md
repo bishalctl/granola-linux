@@ -87,6 +87,10 @@ Some things are different from the macOS build:
   when it ends, and follows default device changes while recording. Use
   `GRANOLA_LINUX_MIC_SOURCE` or `GRANOLA_LINUX_SYSTEM_SOURCE` to select explicit
   PulseAudio source names. This avoids Electron's Windows-only loopback path.
+  The meeting prompt can pin a browser device ID. The adapter maps that ID's
+  label to a PulseAudio source, or follows the active meeting application's
+  microphone when labels are unavailable in the background. An unknown browser
+  hash is never passed to the recorder as a source name.
 - Meeting detection observes active microphone streams and recognizes common
   browsers (including Helium), Zoom, Teams, Slack, and Discord. It publishes
   meeting evidence to Granola's observer; it does not itself start recordings.
