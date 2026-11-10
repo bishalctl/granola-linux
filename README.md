@@ -53,6 +53,15 @@ link; the install registers the handler for it.
 - `make uninstall` removes the app and keeps your notes.
   `./granola-linux uninstall --purge` removes Granola's data too.
 
+For reproducible distribution builds, `sources.json` pins Granola, its matching
+Electron runtime and headers, and the SQLite binding metadata by URL and
+SHA-256. Run `./granola-linux pin sources.json` to refresh that manifest from
+Granola's current full release. This verifies Electron's published checksums
+and npm's integrity metadata; Granola publishes no image checksum, so the
+manifest records the downloaded image's digest. Review and commit the updated
+manifest, then update the distribution's pinned revision of this repository.
+The app does not replace a package-managed installation from inside Electron.
+
 Everything is written as your user: the app under
 `~/.local/share/granola-linux`, downloads under `~/.cache/granola-linux`, and
 Granola's own data under `~/.config/Granola`, where the official app keeps it.

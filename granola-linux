@@ -78,6 +78,7 @@ commands
   status      show what is installed and whether a newer release exists
   prepare DIR apply Linux compatibility fixes to an assembled runtime (offline)
   check-runtime test Linux capture and meeting detection without using audio
+  pin [FILE]  refresh a checksum-pinned source manifest (default sources.json)
   help        show this text
 
 install options
@@ -872,6 +873,69 @@ function setup(command) {
 EOF
 )
 
+# Refresh distribution inputs independently of installation. Electron and its
+# headers are verified against their release checksums, npm against its SRI.
+# Granola publishes no checksum: record its official immutable release URL and
+# the downloaded image's SHA-256 so subsequent builds reject changed bytes.
+cmd_pin() (
+  local target=${1:-sources.json} work dmg app_ver el_ver mod_ver name url want
+  for name in curl python3 sha256sum; do need_cmd "$name"; done
+  mkdir -p "$CACHE_DIR"
+  SEVENZIP=$(find_sevenzip)
+  resolve_latest
+  work=$(mktemp -d "$CACHE_DIR/pin.XXXXXX")
+  trap 'rm -rf "$work"' EXIT
+  dmg="$CACHE_DIR/$(basename "$LATEST_URL_RESOLVED")"
+  [[ -f "$dmg" ]] || fetch "$dmg" "$LATEST_URL_RESOLVED"
+  dmg_extract "$dmg" "$DMG_APP/Info.plist" "$work/app" || die "no app version in image"
+  dmg_extract "$dmg" "$DMG_FRAMEWORK_PLIST" "$work/electron" || die "no Electron version in image"
+  dmg_extract "$dmg" "$DMG_RES/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/package.json" "$work/sqlite" || die "no SQLite metadata in image"
+  app_ver=$(plist_string "$work/app/Info.plist" CFBundleShortVersionString)
+  el_ver=$(plist_string "$work/electron/Info.plist" CFBundleVersion)
+  mod_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$work/sqlite/package.json")
+  [[ -n "$app_ver" && -n "$el_ver" && -n "$mod_ver" ]] || die "could not determine source versions"
+  fetch "$work/electron-sums" "$ELECTRON_RELEASES/v$el_ver/SHASUMS256.txt"
+  fetch "$work/header-sums" "$ELECTRON_HEADERS/v$el_ver/SHASUMS256.txt"
+  for name in "electron-v$el_ver-linux-x64.zip" "node-v$el_ver-headers.tar.gz"; do
+    if [[ "$name" == electron-* ]]; then
+      url="$ELECTRON_RELEASES/v$el_ver/$name"
+      want=$(awk -v file="$name" '$2 == file || $2 == "*" file { print $1 }' "$work/electron-sums")
+    else
+      url="$ELECTRON_HEADERS/v$el_ver/$name"
+      want=$(awk -v file="$name" '$2 == file || $2 == "*" file { print $1 }' "$work/header-sums")
+    fi
+    [[ -n "$want" ]] || die "no published checksum for $name"
+    [[ -f "$CACHE_DIR/$name" ]] || fetch "$CACHE_DIR/$name" "$url"
+    check_sha256 "$CACHE_DIR/$name" "$want"
+  done
+  name="better-sqlite3-multiple-ciphers-$mod_ver.tgz"
+  url="https://registry.npmjs.org/better-sqlite3-multiple-ciphers/-/$name"
+  fetch "$work/sqlite-metadata.json" "https://registry.npmjs.org/better-sqlite3-multiple-ciphers/$mod_ver"
+  [[ -f "$CACHE_DIR/$name" ]] || fetch "$CACHE_DIR/$name" "$url"
+  python3 -I - "$target" "$CACHE_DIR" "$dmg" "$app_ver" "$el_ver" "$mod_ver" "$work/sqlite-metadata.json" <<'EOF'
+import base64, hashlib, json, pathlib, sys
+target, cache, dmg, version, electron, sqlite, metadata = sys.argv[1:]
+cache = pathlib.Path(cache)
+sqlite_file = cache / f'better-sqlite3-multiple-ciphers-{sqlite}.tgz'
+integrity = json.loads(pathlib.Path(metadata).read_text())['dist']['integrity']
+algorithm, expected = integrity.split('-', 1)
+if base64.b64encode(hashlib.new(algorithm, sqlite_file.read_bytes()).digest()).decode() != expected:
+    raise SystemExit('npm SQLite source integrity mismatch')
+files = {
+    'dmg': (pathlib.Path(dmg), f'https://dr2v7l5emb758.cloudfront.net/{version}/Granola-{version}-mac-universal.dmg'),
+    'electron': (cache / f'electron-v{electron}-linux-x64.zip', f'https://github.com/electron/electron/releases/download/v{electron}/electron-v{electron}-linux-x64.zip'),
+    'headers': (cache / f'node-v{electron}-headers.tar.gz', f'https://electronjs.org/headers/v{electron}/node-v{electron}-headers.tar.gz'),
+    'sqlite-gyp': (sqlite_file, f'https://registry.npmjs.org/better-sqlite3-multiple-ciphers/-/better-sqlite3-multiple-ciphers-{sqlite}.tgz'),
+}
+manifest = {'version': version, 'electronVersion': electron, 'sqliteVersion': sqlite, 'sources': {}}
+for name, (file, url) in files.items():
+    digest = base64.b64encode(hashlib.sha256(file.read_bytes()).digest()).decode()
+    manifest['sources'][name] = {'url': url, 'hash': 'sha256-' + digest}
+pathlib.Path(target).write_text(json.dumps(manifest, indent=2) + '\n')
+print(f'Pinned Granola {version}, Electron {electron}, SQLite {sqlite} in {target}')
+EOF
+)
+
 write_desktop_entry() {
   mkdir -p "$(dirname "$DESKTOP_FILE")"
   cat >"$DESKTOP_FILE" <<EOF
@@ -979,6 +1043,7 @@ main() {
     prepare) cmd_prepare "$@" ;;
     emit-runtime) emit_linux_runtime ;;
     check-runtime) cmd_check_runtime ;;
+    pin) cmd_pin "$@" ;;
     help|-h|--help) usage ;;
     --version) echo "granola-linux $VERSION" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
