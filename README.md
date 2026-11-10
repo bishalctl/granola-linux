@@ -16,8 +16,11 @@ the image from Granola, and you sign in with your own account.
 
 ## Install
 
-Requirements: x86-64 Linux, `curl`, `python3`, `node` and `npm`, `make`, and
-`g++` 11 or newer. Reading the disk image needs 7-Zip 21.02 or newer (the
+Requirements: x86-64 Linux, `curl`, `python3` 3.9 or newer, `node` 22.22.2
+or a later 22, 24.15.0 or a later 24, or 26 and newer, `npm`, `make`, and
+`g++` 11 or newer. The Python and Node versions are what the pinned node-gyp
+needs to build the native module, and the script checks them before it
+starts. Reading the disk image needs 7-Zip 21.02 or newer (the
 `7zip` package on Arch, Debian 13 and Ubuntu 24.04 or later). Without one,
 the script fetches the static build from 7-zip.org and checks it against a
 checksum pinned in the script. The `p7zip` most distributions still ship

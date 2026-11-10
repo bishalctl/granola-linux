@@ -213,6 +213,18 @@ cmd_install() {
   step "Checking prerequisites"
   local c
   for c in curl node npm python3 make tar sha256sum; do need_cmd "$c"; done
+  # The gyp bundled with $NODE_GYP declares requires-python >=3.9; older
+  # versions fail inside the build with a SyntaxError that names no version.
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
+    || die "python3 is $(python3 -V 2>&1), node-gyp needs 3.9 or newer (check which python3 is first on your PATH)"
+  # $NODE_GYP's engines field is ^22.22.2 || ^24.15.0 || >=26.0.0; npm
+  # refuses to run it on anything else with a terse "notsup" error.
+  local node_v maj min pat
+  node_v=$(node --version)
+  IFS=. read -r maj min pat <<<"${node_v#v}"
+  (( (maj == 22 && (min > 22 || (min == 22 && pat >= 2))) ||
+     (maj == 24 && min >= 15) || maj >= 26 )) \
+    || die "node is $node_v, node-gyp needs ^22.22.2, ^24.15.0 or 26 and newer"
   mkdir -p "$CACHE_DIR"
   SEVENZIP=$(find_sevenzip)
   find_compiler
