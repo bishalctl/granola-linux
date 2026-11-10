@@ -527,6 +527,24 @@ const {spawn, execFile, execFileSync} = require('node:child_process');
 // Let the compositor own mapped tiles; retain native sizing for floating
 // windows, XWayland, other desktops and every secondary/notification window.
 const managedPrimaryWindows = new WeakSet();
+let primaryWindow, mediaInputCache = [];
+async function readMediaInputs() {
+  const win = primaryWindow;
+  if (!win || win.isDestroyed?.() || win.isVisible?.() === false || !win.webContents) return mediaInputCache;
+  let timeout;
+  try {
+    const request = win.webContents.executeJavaScript(
+      "navigator.mediaDevices.enumerateDevices().then(ds => ds.filter(d => d.kind === 'audioinput').map(d => ({deviceId: d.deviceId, label: d.label})))"
+    ).then(devices => {
+      if (Array.isArray(devices) && win === primaryWindow) mediaInputCache = devices;
+      return mediaInputCache;
+    });
+    return await Promise.race([request, new Promise(resolve => {
+      timeout = setTimeout(() => resolve(mediaInputCache), 250);
+    })]);
+  } catch { return mediaInputCache; }
+  finally { clearTimeout(timeout); }
+}
 // macOS delivers cold-start URLs through open-url. Linux desktop handlers
 // deliver them in argv instead. Use Granola's own parser, duplicate guard and
 // pending-link dispatcher so login callbacks and note links take the same path.
@@ -539,6 +557,11 @@ function managePrimaryWindow(window, {platform = process.platform, env = process
     pid = process.pid, query = () => execFileSync('hyprctl', ['-j', 'clients'],
       {encoding: 'utf8', timeout: 500, maxBuffer: 8 * 1024 * 1024,
        stdio: ['ignore', 'pipe', 'ignore']})} = {}) {
+  if (window && platform === 'linux' && primaryWindow !== window) {
+    primaryWindow = window;
+    mediaInputCache = [];
+    window.webContents?.on('did-finish-load', () => { readMediaInputs(); });
+  }
   if (!window || managedPrimaryWindows.has(window) || platform !== 'linux' ||
       !env.WAYLAND_DISPLAY || !env.HYPRLAND_INSTANCE_SIGNATURE) return;
   managedPrimaryWindows.add(window);
@@ -569,13 +592,44 @@ function execute(command, args) {
     (error, stdout) => error ? reject(error) : resolve(stdout.trim())));
 }
 
+// The app pins WebRTC device hashes when a meeting is detected. Those hashes
+// are not PulseAudio source names: passing one to parec drops the microphone.
+// Resolve browser labels to Pulse sources; if labels are unavailable while the
+// app is hidden, follow the active meeting app's actual microphone, then the
+// current default. Explicit Pulse source overrides always take precedence.
+async function resolveMicrophone(input, {command = execute, env = process.env,
+    devices = readMediaInputs} = {}) {
+  if (env.GRANOLA_LINUX_MIC_SOURCE) return env.GRANOLA_LINUX_MIC_SOURCE;
+  const fallback = () => command('pactl', ['get-default-source']);
+  if (input == null || ['default', 'communications'].includes(String(input))) return fallback();
+  const sources = JSON.parse(await command('pactl', ['--format=json', 'list', 'sources']));
+  const id = String(input).replace(/^pulse:/, '');
+  const direct = sources.find(source => source.name === id || String(source.index) === id);
+  if (direct) return direct.name;
+  const normalize = label => String(label || '').replace(/^(default|communications)\s*-\s*/i, '').trim().toLowerCase();
+  const media = await devices();
+  const label = normalize(media.find(device => device.deviceId === input)?.label);
+  if (label) {
+    const matches = sources.filter(source => [source.description, source.properties?.['device.description']]
+      .some(description => normalize(description) === label));
+    if (matches.length === 1) return matches[0].name;
+  }
+  const apps = parseMeetingApps(JSON.parse(await command('pactl', ['--format=json', 'list', 'source-outputs'])));
+  for (const app of apps) {
+    const index = app.deviceUID.replace(/^pulse:/, '');
+    const source = sources.find(source => String(source.index) === index);
+    if (source) return source.name;
+  }
+  return fallback();
+}
+
 function createCapture({emit, launch = spawn, command = execute, env = process.env,
-                        every = setInterval, cancel = clearInterval} = {}) {
+                        devices = readMediaInputs, every = setInterval, cancel = clearInterval} = {}) {
   let epoch = 0, active = false, rate = 16000, poll, polling = false, input;
   const streams = new Map();
   const defaults = {};
   const selected = async kind => kind === 'microphone'
-    ? input || env.GRANOLA_LINUX_MIC_SOURCE || await command('pactl', ['get-default-source'])
+    ? resolveMicrophone(input, {command, env, devices})
     : env.GRANOLA_LINUX_SYSTEM_SOURCE || `${await command('pactl', ['get-default-sink'])}.monitor`;
   const log = (level, event, payload) => emit({event: 'log-to-backend', level,
     logEvent: event, payload});
@@ -747,7 +801,7 @@ async function microphonePermission(callback) {
   try { await execute('pactl', ['info']); callback(true); }
   catch { callback(false); }
 }
-module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow, handleStartupLink};
+module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow, handleStartupLink, resolveMicrophone};
 EOF
 }
 
@@ -977,7 +1031,7 @@ cmd_check_runtime() (
   node - "$test_dir/runtime.cjs" <<'EOF'
 const assert = require('node:assert/strict');
 const {EventEmitter} = require('node:events');
-const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow, handleStartupLink} = require(process.argv[2]);
+const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow, handleStartupLink, resolveMicrophone} = require(process.argv[2]);
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function setup(command) {
   const children = [], events = [], timers = [];
@@ -1001,6 +1055,39 @@ function setup(command) {
   return {capture, children, events, timers, get cancelled() { return cancelled; }};
 }
 (async () => {
+  const sourceRows = [
+    {index: 0, name: 'mic-a', description: 'First Microphone'},
+    {index: 7, name: 'mic-b', description: 'Second Microphone'},
+  ];
+  let browserOutputs = [{source: 7, properties: {'application.process.binary': 'helium'}}];
+  const resolver = {env: {}, devices: async () => [], command: async (_binary, args) =>
+    args[0] === 'get-default-source' ? 'mic-a' : JSON.stringify(args.at(-1) === 'sources' ? sourceRows : browserOutputs)};
+  assert.equal(await resolveMicrophone('mic-b', resolver), 'mic-b');
+  assert.equal(await resolveMicrophone(0, resolver), 'mic-a');
+  assert.equal(await resolveMicrophone('pulse:7', resolver), 'mic-b');
+  assert.equal(await resolveMicrophone('web-hash', {...resolver, devices: async () => [
+    {deviceId: 'web-hash', label: 'Default - First Microphone'}]}), 'mic-a');
+  assert.equal(await resolveMicrophone('opaque-web-hash', resolver), 'mic-b', 'meeting microphone hash was passed to parec');
+  browserOutputs = [];
+  assert.equal(await resolveMicrophone('unavailable-hash', resolver), 'mic-a');
+  assert.equal(await resolveMicrophone('default', resolver), 'mic-a');
+  assert.equal(await resolveMicrophone('opaque-web-hash', {...resolver, env: {GRANOLA_LINUX_MIC_SOURCE: 'override'}}), 'override');
+  const pinned = setup(async (_binary, args) => {
+    if (args[0] === 'get-default-source') return 'mic-a';
+    if (args[0] === 'get-default-sink') return 'speaker';
+    return JSON.stringify(args.at(-1) === 'sources' ? sourceRows : [
+      {source: 7, properties: {'application.process.binary': 'helium'}}]);
+  });
+  await pinned.capture.start(16000);
+  await pinned.capture.handle({event: 'set-input-device', deviceId: 'browser-device-hash'});
+  assert(pinned.children[0].killed);
+  assert(!pinned.children[1].killed, 'microphone selection restarted system audio');
+  assert(pinned.children[2].args.includes('--device=mic-b'));
+  await pinned.capture.handle({event: 'unpin-input-device'});
+  assert(pinned.children[2].killed);
+  assert(pinned.children[3].args.includes('--device=mic-a'));
+  pinned.capture.stop();
+  assert(pinned.children.every(child => child.killed));
   const opened = [], seen = new Set();
   const startup = {platform: 'linux', parse: args => args.find(x => x.startsWith('granola://')),
     accept: url => { if (seen.has(url)) return false; seen.add(url); return true; }, open: url => opened.push(url)};
@@ -1112,7 +1199,7 @@ function setup(command) {
   unsubscribe();
   await tick();
   assert(stopTimer && updates.length === 1, 'unsubscribe left detection active');
-  console.log('Linux runtime: startup links, tiled geometry, floating window APIs, PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
+  console.log('Linux runtime: microphone device resolution, startup links, tiled geometry, floating window APIs, PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 EOF
 )
