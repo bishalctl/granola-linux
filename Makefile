@@ -12,6 +12,7 @@ help: ## Show the targets
 	@echo "  DMG=path on install uses a disk image you already have."
 
 check: lint ## Run every check
+	$(SCRIPT) check-runtime
 
 lint: ## Check the script's syntax and run shellcheck
 	bash -n $(SCRIPT)

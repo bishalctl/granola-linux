@@ -1,5 +1,10 @@
 # granola-linux
 
+This fork maintains Linux meeting capture and detection alongside the official
+Granola application. Google Calendar, sign-in, sync, and integrations continue
+to use Granola's own application and services. Account access and integration
+permissions still belong to the signed-in user.
+
 `granola-linux` installs [Granola](https://www.granola.ai), the AI meeting
 notepad, on a Linux desktop. Granola publishes builds for macOS and Windows
 only. Its macOS disk image, however, is an Electron bundle: the app itself is
@@ -65,10 +70,17 @@ Wayland.
 
 Some things are different from the macOS build:
 
-- Capture of the other side of a call. On macOS Granola taps system audio
-  through Core Audio. The Linux runtime has no such path, so the launcher
-  turns on Chromium's PipeWire capturer and the app records what the desktop
-  portal offers it.
+- Meeting capture uses two PulseAudio PCM streams (including PipeWire's
+  PulseAudio compatibility service): the default microphone and the default
+  output's monitor. Both feed the app's existing transcription pipeline.
+  Install `pactl` and `parec` from your distribution's PulseAudio tools package.
+  Capture starts only when Granola requests a recording, stops both streams
+  when it ends, and follows default device changes while recording. Use
+  `GRANOLA_LINUX_MIC_SOURCE` or `GRANOLA_LINUX_SYSTEM_SOURCE` to select explicit
+  PulseAudio source names. This avoids Electron's Windows-only loopback path.
+- Meeting detection observes active microphone streams and recognizes common
+  browsers (including Helium), Zoom, Teams, Slack, and Discord. It publishes
+  meeting evidence to Granola's observer; it does not itself start recordings.
 - Granola's auto-update is off. The installed version is pinned; `make
   status` tells you when a new release is out and `make install` brings it
   in.
@@ -132,6 +144,15 @@ display. Only then is the new app swapped into place, so a failed build never
 replaces a working one. If the system restricts unprivileged user namespaces,
 which Chromium's sandbox needs, the script prints the root command that
 enables the setuid sandbox helper rather than running anything as root.
+
+Distribution packages can assemble the matching Electron runtime and rebuild
+SQLite with their own toolchain, then run `./granola-linux prepare APPDIR`.
+This applies the same compatibility changes without network access or writing
+launchers into a user's home directory. The Linux audio adapter is generated
+from this script; there is no vendored copy of Granola's application code.
+`make check` also tests PCM framing, independent sources, cancellation during
+device discovery, stream cleanup, device changes, and meeting detection with
+isolated process fixtures. It does not open the microphone or contact Granola.
 
 ## Safety and terms
 
