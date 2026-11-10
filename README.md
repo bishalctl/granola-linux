@@ -148,6 +148,12 @@ the exact Electron headers used by the app.
 - The tray icons. The macOS tray images are black template shapes that only
   macOS tints; on a dark Linux panel they are invisible. The coloured app icon
   takes their place.
+- Tiled window geometry on Hyprland. Granola requests a fixed size when it
+  changes views. Electron applies that size to its page even when the tile
+  stays larger, leaving empty space until focus changes. The primary window
+  checks `hyprctl` before unmaximizing or applying fixed bounds and lets
+  the compositor control its size. Floating windows, hidden-window opening,
+  XWayland, other desktops and notification windows keep their native APIs.
 
 **The safety net.** The rebuilt module and the drag stub are run inside the
 installed Electron before anything is installed: the test opens an encrypted
