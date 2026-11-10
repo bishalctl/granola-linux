@@ -489,6 +489,8 @@ smoke_test() {
     db.prepare('INSERT INTO t VALUES (1)').run();
     if (db.prepare('SELECT count(*) c FROM t').get().c !== 1) throw new Error('insert failed');
     if (!fired) throw new Error('updateHook did not fire');
+    const dependencies = db.prepare(\"SELECT name FROM tables_used('SELECT * FROM t') WHERE type='table'\").all();
+    if (!dependencies.some(row => row.name === 't')) throw new Error('tables_used dependency tracking failed');
     db.close();
     process.env.WAYLAND_DISPLAY = 'smoke';
     require(process.argv[3]).startDrag(Buffer.alloc(8));
@@ -821,6 +823,14 @@ if 'SQLITE_OMIT_TRUNCATE_OPTIMIZATION' not in d:
     if d.count("'defines': [") != 1:
         raise SystemExit('SQLite build definitions changed; review change notifications')
     defines.write_text(d.replace("'defines': [", "'defines': [\n    'SQLITE_OMIT_TRUNCATE_OPTIMIZATION',"))
+# Granola's renderer uses SQLite's built-in tables_used() virtual table to
+# subscribe live queries to table changes. Without this build option every
+# screen, including login, falls into the React error boundary.
+d = defines.read_text()
+if 'SQLITE_ENABLE_BYTECODE_VTAB' not in d:
+    if d.count("'defines': [") != 1:
+        raise SystemExit('SQLite build definitions changed; review live queries')
+    defines.write_text(d.replace("'defines': [", "'defines': [\n    'SQLITE_ENABLE_BYTECODE_VTAB',"))
 if 'JS_updateHook' in s:
     print('    SQLite updateHook already present')
     raise SystemExit(0)
