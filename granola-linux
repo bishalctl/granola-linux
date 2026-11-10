@@ -326,9 +326,16 @@ cmd_install() {
   info "better-sqlite3-multiple-ciphers $mod_ver"
   cp -r "$src" "$build"
   ( cd "$work" && npm pack "better-sqlite3-multiple-ciphers@$mod_ver" --silent >/dev/null \
-      && tar xzf better-sqlite3-multiple-ciphers-*.tgz package/binding.gyp ) \
+      && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) \
     || die "could not fetch binding.gyp for better-sqlite3-multiple-ciphers@$mod_ver"
+  # Recent Granola images omit the C++ sources entirely. Build the matching
+  # public source with our updateHook adapter in that case; never substitute a
+  # binary built for a different Electron ABI or silently drop change events.
+  if [[ ! -f "$build/src/objects/database.cpp" ]]; then
+    cp -r "$work/package/src" "$work/package/deps" "$build/"
+  fi
   cp "$work/package/binding.gyp" "$build/"
+  cmd_prepare_sqlite "$build"
   ( cd "$build" && CC=$CC CXX=$CXX npm_config_devdir="$CACHE_DIR/node-gyp" \
       npm exec --yes --package="$NODE_GYP" -- node-gyp rebuild --release \
         --runtime=electron --target="$el_ver" --arch=x64 --dist-url="$ELECTRON_HEADERS" ) \
@@ -742,7 +749,7 @@ if marker not in source:
         value = replacement if entry is main else content(entry)
         entry['offset'] = str(len(packed))
         entry['size'] = len(value)
-        if entry is main and 'integrity' in entry:
+        if 'integrity' in entry:
             integrity = entry['integrity']
             block = integrity['blockSize']
             integrity['hash'] = hashlib.sha256(value).hexdigest()
@@ -765,6 +772,142 @@ cmd_prepare() {
   patch_tray_icons "$stage/resources/icons"
   patch_linux_runtime "$stage"
   node --check "$stage/resources/granola-linux.cjs"
+}
+
+# Granola's JS wrapper calls updateHook(operation, database, table, rowid), but
+# newer images ship no private C++ sources. Supply that API over SQLite's own
+# update hook in the matching MIT-licensed public module. Keep encryption,
+# transactions and query handling in upstream SQLite; callbacks cannot outlive
+# their database and callback exceptions interrupt/propagate the SQL operation.
+cmd_prepare_sqlite() {
+  python3 -I - "${1:?prepare-sqlite needs an unpacked SQLite source directory}" <<'EOF'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1]) / 'src/objects'
+header = root / 'database.hpp'
+source = root / 'database.cpp'
+h, s = header.read_text(), source.read_text()
+# Electron 45's V8 15.6 removes the transitional V2 APIs and requires an
+# explicit external-pointer tag. Keep older Electron builds on their original
+# API paths while compiling this exact public source against current headers.
+macros = root.parent / 'util/macros.cpp'
+entry = root.parent / 'better_sqlite3.cpp'
+if 'GRANOLA_V8_COMPAT' not in macros.read_text():
+    cpp = entry.read_text()
+    if cpp.count('v8::External::New(isolate, addon)') != 1:
+        raise SystemExit('SQLite external pointer setup changed; review V8 compatibility')
+    compatibility = r'''
+/* GRANOLA_V8_COMPAT */
+#if V8_MAJOR_VERSION > 15 || (V8_MAJOR_VERSION == 15 && V8_MINOR_VERSION >= 6)
+#undef GET_PROTOTYPE
+#define GET_PROTOTYPE(obj) ((obj)->GetPrototype())
+#undef PROPERTY_HOLDER
+#define PROPERTY_HOLDER(info) (info).Holder()
+#undef OnlyAddon
+#define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault))
+#define GRANOLA_EXTERNAL_NEW(isolate, value) v8::External::New(isolate, value, v8::kExternalPointerTypeTagDefault)
+#else
+#define GRANOLA_EXTERNAL_NEW(isolate, value) v8::External::New(isolate, value)
+#endif
+'''
+    macros.write_text(macros.read_text() + compatibility)
+    entry.write_text(cpp.replace('v8::External::New(isolate, addon)', 'GRANOLA_EXTERNAL_NEW(isolate, addon)'))
+# SQLite's truncate shortcut skips per-row update hooks on a full-table DELETE.
+# Disable that optimization so Granola's table-change cache is invalidated for
+# bulk deletes as well as inserts and targeted updates/deletes.
+defines = root.parent.parent / 'deps/defines.gypi'
+d = defines.read_text()
+if 'SQLITE_OMIT_TRUNCATE_OPTIMIZATION' not in d:
+    if d.count("'defines': [") != 1:
+        raise SystemExit('SQLite build definitions changed; review change notifications')
+    defines.write_text(d.replace("'defines': [", "'defines': [\n    'SQLITE_OMIT_TRUNCATE_OPTIMIZATION',"))
+if 'JS_updateHook' in s:
+    print('    SQLite updateHook already present')
+    raise SystemExit(0)
+anchors = [
+    (h, '\tstatic NODE_METHOD(JS_close);'),
+    (h, '\tstd::set<Backup*, CompareBackup> backups;'),
+    (s, '\tSetPrototypeMethod(isolate, data, t, "close", JS_close);'),
+    (s, '\t\tbackups.clear();\n\t\tint status = sqlite3_close(db_handle);'),
+    (s, 'NODE_METHOD(Database::JS_close) {'),
+]
+if any(text.count(anchor) != 1 for text, anchor in anchors):
+    raise SystemExit('SQLite source layout changed; review the updateHook adapter')
+h = h.replace('\tstatic NODE_METHOD(JS_close);', '\tstatic NODE_METHOD(JS_updateHook);\n\tstatic void UpdateHook(void*, int, const char*, const char*, sqlite3_int64);\n\tstatic NODE_METHOD(JS_close);')
+h = h.replace('\tstd::set<Backup*, CompareBackup> backups;', '\tstd::set<Backup*, CompareBackup> backups;\n\tv8::Global<v8::Function> update_hook;\n\tv8::Global<v8::Context> update_context;\n\tv8::Global<v8::Value> update_exception;')
+s = s.replace('\tSetPrototypeMethod(isolate, data, t, "close", JS_close);', '\tSetPrototypeMethod(isolate, data, t, "updateHook", JS_updateHook);\n\tSetPrototypeMethod(isolate, data, t, "close", JS_close);')
+s = s.replace('\t\tbackups.clear();\n\t\tint status = sqlite3_close(db_handle);', '\t\tbackups.clear();\n\t\tsqlite3_update_hook(db_handle, NULL, NULL);\n\t\tupdate_hook.Reset();\n\t\tupdate_context.Reset();\n\t\tupdate_exception.Reset();\n\t\tint status = sqlite3_close(db_handle);')
+s = s.replace('if (was_js_error) was_js_error = false;', '''if (was_js_error) {
+        was_js_error = false;
+        if (!update_exception.IsEmpty()) {
+            EasyIsolate;
+            auto error = update_exception.Get(isolate);
+            update_exception.Reset();
+            isolate->ThrowException(error);
+        }
+    }''')
+s = s.replace('if (status != SQLITE_OK) break;', 'if (status != SQLITE_OK || db->was_js_error) break;')
+s = s.replace('db->busy = false;\n\tif (status != SQLITE_OK) {', 'db->busy = false;\n\tif (status != SQLITE_OK || db->was_js_error) {')
+implementation = r'''
+NODE_METHOD(Database::JS_updateHook) {
+    UseIsolate;
+    Database* db = Unwrap<Database>(info.This());
+    REQUIRE_DATABASE_OPEN(db);
+    REQUIRE_DATABASE_NOT_BUSY(db);
+    if (info.Length() == 0 || info[0]->IsNullOrUndefined()) {
+        sqlite3_update_hook(db->db_handle, NULL, NULL);
+        db->update_hook.Reset();
+        db->update_context.Reset();
+    } else {
+        if (!info[0]->IsFunction()) { ThrowTypeError("updateHook expects a function or null"); return; }
+        db->update_hook.Reset(isolate, info[0].As<v8::Function>());
+        db->update_context.Reset(isolate, OnlyContext);
+        sqlite3_update_hook(db->db_handle, UpdateHook, db);
+    }
+}
+
+void Database::UpdateHook(void* opaque, int operation, const char* database, const char* table, sqlite3_int64 rowid) {
+    Database* db = static_cast<Database*>(opaque);
+    if (!db->open || db->update_hook.IsEmpty()) return;
+    EasyIsolate;
+    v8::HandleScope scope(isolate);
+    auto context = db->update_context.Get(isolate);
+    v8::Context::Scope context_scope(context);
+    v8::Local<v8::Value> id;
+    if (db->safe_ints) id = v8::BigInt::New(isolate, rowid);
+    else id = v8::Number::New(isolate, static_cast<double>(rowid));
+    v8::Local<v8::Value> args[] = {
+        v8::Integer::New(isolate, operation),
+        StringFromUtf8(isolate, database, -1),
+        StringFromUtf8(isolate, table, -1), id
+    };
+    v8::TryCatch caught(isolate);
+    if (db->update_hook.Get(isolate)->Call(context, v8::Undefined(isolate), 4, args).IsEmpty()) {
+        db->update_exception.Reset(isolate, caught.Exception());
+        db->was_js_error = true;
+        sqlite3_interrupt(db->db_handle);
+    }
+}
+
+'''
+s = s.replace('NODE_METHOD(Database::JS_close) {', implementation + 'NODE_METHOD(Database::JS_close) {')
+header.write_text(h)
+source.write_text(s)
+query = root.parent / 'util/query-macros.cpp'
+q = query.read_text()
+anchor = '\tinfo.GetReturnValue().Set(return_value);'
+if q.count(anchor) != 1:
+    raise SystemExit('SQLite statement return path changed; review callback errors')
+guard = '\tif (stmt->db->GetState()->was_js_error) { \\\n\t\tstmt->db->ThrowDatabaseError(); \\\n\t\tif (!bound) { sqlite3_clear_bindings(handle); } \\\n\t\treturn; \\\n\t} \\\n'
+query.write_text(q.replace(anchor, guard + anchor))
+iterator = root / 'statement-iterator.cpp'
+it = iterator.read_text()
+anchor = '\tdb_state->busy = false;\n\tif (status == SQLITE_ROW) {'
+if it.count(anchor) != 1:
+    raise SystemExit('SQLite iterator return path changed; review callback errors')
+iterator.write_text(it.replace(anchor, '\tdb_state->busy = false;\n\tif (db_state->was_js_error) status = SQLITE_ERROR;\n\tif (status == SQLITE_ROW) {'))
+print('    SQLite updateHook adapter prepared')
+EOF
 }
 
 cmd_check_runtime() (
@@ -1041,6 +1184,7 @@ main() {
     uninstall) cmd_uninstall "$@" ;;
     status) cmd_status "$@" ;;
     prepare) cmd_prepare "$@" ;;
+    prepare-sqlite) cmd_prepare_sqlite "$@" ;;
     emit-runtime) emit_linux_runtime ;;
     check-runtime) cmd_check_runtime ;;
     pin) cmd_pin "$@" ;;

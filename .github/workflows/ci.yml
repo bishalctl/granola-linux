@@ -23,3 +23,34 @@ jobs:
           persist-credentials: false
       - name: Check
         run: make check
+
+  current-release:
+    name: matching Electron and encrypted SQLite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+      - name: Fetch the pinned official image
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          pin = json.loads(pathlib.Path('sources.json').read_text())['sources']['dmg']
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'Granola.dmg'
+          urllib.request.urlretrieve(pin['url'], target)
+          digest = 'sha256-' + base64.b64encode(hashlib.sha256(target.read_bytes()).digest()).decode()
+          if digest != pin['hash']:
+              raise SystemExit('Pinned Granola image checksum mismatch')
+          PY
+      - name: Build and test in scratch directories
+        env:
+          GRANOLA_LINUX_HOME: ${{ runner.temp }}/granola-install
+          GRANOLA_LINUX_CACHE: ${{ runner.temp }}/granola-cache
+          GRANOLA_LINUX_BIN_DIR: ${{ runner.temp }}/granola-bin
+          XDG_DATA_HOME: ${{ runner.temp }}/xdg-data
+          XDG_CONFIG_HOME: ${{ runner.temp }}/xdg-config
+        run: ./granola-linux install --dmg "$RUNNER_TEMP/Granola.dmg"

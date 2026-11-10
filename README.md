@@ -32,7 +32,7 @@ checksum pinned in the script. The `p7zip` most distributions still ship
 cannot read the image's compression.
 
 ```sh
-git clone https://github.com/cacarico/granola-linux
+git clone https://github.com/bishalctl/granola-linux
 cd granola-linux
 make install DRY_RUN=1   # prints what would happen, changes nothing
 make install             # installs the current release
@@ -120,12 +120,15 @@ renamed `granola`, because an Electron binary called `electron` reports the
 app as unpackaged and Granola then runs with developer tooling and a "Not
 packaged" tray menu.
 
-**The SQLite module.** Granola uses a fork of `better-sqlite3-multiple-ciphers`
-with an `updateHook` method that no published build has. The fork's C++
-source ships in the image; only `binding.gyp` is missing, and npm supplies it
-from the release of the same version. The module is compiled against the
-Electron headers for the installed runtime, with the newest `g++` of version
-11 or later on the system.
+**The SQLite module.** Granola uses `better-sqlite3-multiple-ciphers` with an
+additional `updateHook` method. Older images include that fork's C++ sources;
+newer images omit them. When they are absent, the matching public module is
+built with a small adapter over SQLite's `sqlite3_update_hook` API. It reports
+operation, database, table, and row ID, unregisters on close, and propagates
+callback errors through the executing statement. Encryption and queries stay
+in the upstream library. `prepare-sqlite DIR` adds the adapter to an unpacked
+public source tree for distribution builds. The module is compiled against
+the exact Electron headers used by the app.
 
 **The patches.**
 
