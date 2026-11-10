@@ -76,6 +76,9 @@ commands
   install     download the current release (or use --dmg) and install it
   uninstall   remove the install; --purge also removes Granola's user data
   status      show what is installed and whether a newer release exists
+  prepare DIR apply Linux compatibility fixes to an assembled runtime (offline)
+  check-runtime test Linux capture and meeting detection without using audio
+  pin [FILE]  refresh a checksum-pinned source manifest (default sources.json)
   help        show this text
 
 install options
@@ -323,9 +326,16 @@ cmd_install() {
   info "better-sqlite3-multiple-ciphers $mod_ver"
   cp -r "$src" "$build"
   ( cd "$work" && npm pack "better-sqlite3-multiple-ciphers@$mod_ver" --silent >/dev/null \
-      && tar xzf better-sqlite3-multiple-ciphers-*.tgz package/binding.gyp ) \
+      && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) \
     || die "could not fetch binding.gyp for better-sqlite3-multiple-ciphers@$mod_ver"
+  # Recent Granola images omit the C++ sources entirely. Build the matching
+  # public source with our updateHook adapter in that case; never substitute a
+  # binary built for a different Electron ABI or silently drop change events.
+  if [[ ! -f "$build/src/objects/database.cpp" ]]; then
+    cp -r "$work/package/src" "$work/package/deps" "$build/"
+  fi
   cp "$work/package/binding.gyp" "$build/"
+  cmd_prepare_sqlite "$build"
   ( cd "$build" && CC=$CC CXX=$CXX npm_config_devdir="$CACHE_DIR/node-gyp" \
       npm exec --yes --package="$NODE_GYP" -- node-gyp rebuild --release \
         --runtime=electron --target="$el_ver" --arch=x64 --dist-url="$ELECTRON_HEADERS" ) \
@@ -346,9 +356,7 @@ cmd_install() {
   cp "$build/build/Release/better_sqlite3.node" "$stage/resources/app.asar.unpacked/$mod/build/Release/"
   [[ -f "$build/build/Release/test_extension.node" ]] \
     && cp "$build/build/Release/test_extension.node" "$stage/resources/app.asar.unpacked/$mod/build/Release/"
-  patch_asar "$stage/resources/app.asar"
-  patch_click_drag "$stage/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin"
-  patch_tray_icons "$stage/resources/icons"
+  cmd_prepare "$stage"
 
   step "Testing the build"
   smoke_test "$stage"
@@ -481,6 +489,8 @@ smoke_test() {
     db.prepare('INSERT INTO t VALUES (1)').run();
     if (db.prepare('SELECT count(*) c FROM t').get().c !== 1) throw new Error('insert failed');
     if (!fired) throw new Error('updateHook did not fire');
+    const dependencies = db.prepare(\"SELECT name FROM tables_used('SELECT * FROM t') WHERE type='table'\").all();
+    if (!dependencies.some(row => row.name === 't')) throw new Error('tables_used dependency tracking failed');
     db.close();
     process.env.WAYLAND_DISPLAY = 'smoke';
     require(process.argv[3]).startDrag(Buffer.alloc(8));
@@ -501,6 +511,583 @@ EOF
   mkdir -p "$BIN_DIR"
   ln -sfn "$LAUNCHER" "$BIN_DIR/granola"
 }
+
+# The upstream browser capture path uses Electron loopback, which is supported
+# on Windows, not Linux. Preserve Granola's own audio batching, transcription,
+# volume events and lifecycle, and supply its existing IPC protocol with two
+# independent PCM streams from PipeWire's PulseAudio interface instead.
+emit_linux_runtime() {
+  cat <<'EOF'
+'use strict';
+const {spawn, execFile} = require('node:child_process');
+
+function execute(command, args) {
+  return new Promise((resolve, reject) => execFile(command, args,
+    {encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024},
+    (error, stdout) => error ? reject(error) : resolve(stdout.trim())));
+}
+
+function createCapture({emit, launch = spawn, command = execute, env = process.env,
+                        every = setInterval, cancel = clearInterval} = {}) {
+  let epoch = 0, active = false, rate = 16000, poll, polling = false, input;
+  const streams = new Map();
+  const defaults = {};
+  const selected = async kind => kind === 'microphone'
+    ? input || env.GRANOLA_LINUX_MIC_SOURCE || await command('pactl', ['get-default-source'])
+    : env.GRANOLA_LINUX_SYSTEM_SOURCE || `${await command('pactl', ['get-default-sink'])}.monitor`;
+  const log = (level, event, payload) => emit({event: 'log-to-backend', level,
+    logEvent: event, payload});
+  function close(kind) {
+    const stream = streams.get(kind);
+    streams.delete(kind); // invalidate callbacks before terminating the child
+    if (stream) stream.process.kill('SIGTERM');
+  }
+  function stop() {
+    epoch++;
+    active = false;
+    if (poll) cancel(poll);
+    poll = undefined;
+    for (const kind of [...streams.keys()]) close(kind);
+  }
+  function open(kind, device, generation) {
+    close(kind);
+    const child = launch('parec', ['--raw', '--format=s16le', `--rate=${rate}`,
+      '--channels=1', '--latency-msec=100', `--device=${device}`,
+      '--client-name=Granola', '--stream-name=Granola meeting capture',
+      '--property=application.id=com.granola.app'], {stdio: ['ignore', 'pipe', 'pipe']});
+    const stream = {process: child, pending: Buffer.alloc(0), failed: false};
+    streams.set(kind, stream);
+    defaults[kind] = device;
+    const current = () => active && generation === epoch && streams.get(kind) === stream;
+    const frameBytes = Math.round(rate / 10) * 2; // mono signed 16-bit, 100 ms
+    child.stdout.on('data', data => {
+      if (!current()) return;
+      stream.pending = Buffer.concat([stream.pending, data]);
+      while (current() && stream.pending.length >= frameBytes) {
+        const buffer = Buffer.from(stream.pending.subarray(0, frameBytes));
+        stream.pending = stream.pending.subarray(frameBytes);
+        emit({event: 'audio-capture-buffer',
+          microphoneBuffer: kind === 'microphone' ? buffer : null,
+          systemAudioBuffer: kind === 'system' ? buffer : null});
+        let energy = 0;
+        for (let i = 0; i < buffer.length; i += 2) energy += (buffer.readInt16LE(i) / 32768) ** 2;
+        stream.volume = Math.sqrt(energy / (buffer.length / 2));
+        emit({event: 'audio-volume',
+          microphone: streams.get('microphone')?.volume || 0,
+          system: streams.get('system')?.volume || 0});
+      }
+    });
+    let diagnostic = '';
+    child.stderr.on('data', data => { diagnostic = (diagnostic + data).slice(-2048); });
+    const failed = reason => {
+      if (!current() || stream.failed) return;
+      stream.failed = true;
+      log('error', 'linux-audio-source-error', {source: kind, reason: String(reason), diagnostic});
+      emit({event: 'audio-capture-source-error', source: kind});
+    };
+    child.on('error', failed);
+    child.on('exit', (code, signal) => failed(`parec exited ${code ?? signal}`));
+  }
+  async function refresh(generation) {
+    if (!active || polling) return;
+    polling = true;
+    try {
+      const devices = await Promise.all(['microphone', 'system'].map(selected));
+      if (!active || epoch !== generation) return;
+      for (const [i, kind] of ['microphone', 'system'].entries()) {
+        if (devices[i] !== defaults[kind] || !streams.has(kind)) open(kind, devices[i], generation);
+      }
+    } catch (error) {
+      if (active && epoch === generation) log('warn', 'linux-audio-device-query-failed', {error: error.message});
+    } finally { polling = false; }
+  }
+  async function start(sampleRate) {
+    stop();
+    rate = sampleRate || 16000;
+    if (!Number.isInteger(rate) || rate < 8000 || rate > 192000) throw Error('Invalid audio sample rate');
+    active = true;
+    const generation = epoch;
+    try {
+      const devices = await Promise.all(['microphone', 'system'].map(selected));
+      if (!active || epoch !== generation) return;
+      open('microphone', devices[0], generation);
+      open('system', devices[1], generation);
+      poll = every(() => refresh(generation), 1500);
+      poll?.unref?.();
+      log('info', 'linux-audio-capture-started', {sampleRate: rate});
+    } catch (error) {
+      if (active && epoch === generation) {
+        stop();
+        log('error', 'linux-audio-start-failed', {error: error.message});
+        emit({event: 'audio-capture-source-error', source: 'system'});
+      }
+    }
+  }
+  return {
+    start, stop,
+    async handle(message) {
+      switch (message.event) {
+        case 'start-audio-capture': return start(message.sampleRate);
+        case 'stop-audio-capture': return stop();
+        case 'reacquire-system-audio':
+          if (active) { close('system'); await refresh(epoch); }
+          return;
+        case 'set-input-device':
+          input = message.deviceId;
+          if (active) await refresh(epoch);
+          return;
+        case 'unpin-input-device':
+          input = undefined;
+          if (active) await refresh(epoch);
+          return;
+        default: return;
+      }
+    },
+    get active() { return active; },
+  };
+}
+
+// Use the same application identifiers Granola's Windows monitor supplies.
+// This detects microphone use; it never starts a recording or joins a call.
+const meetingApps = {
+  chrome: 'com.google.Chrome', 'google-chrome': 'com.google.Chrome',
+  'google-chrome-stable': 'com.google.Chrome', chromium: 'com.google.Chrome',
+  'chromium-browser': 'com.google.Chrome', helium: 'com.google.Chrome',
+  firefox: 'org.mozilla.firefox', 'firefox-bin': 'org.mozilla.firefox',
+  zen: 'app.zen-browser.zen', 'zen-browser': 'app.zen-browser.zen',
+  brave: 'com.brave.Browser', 'brave-browser': 'com.brave.Browser',
+  msedge: 'com.microsoft.edgemac', 'microsoft-edge': 'com.microsoft.edgemac',
+  zoom: 'us.zoom.xos', zoomlauncher: 'us.zoom.xos',
+  slack: 'com.tinyspeck.slackmacgap', teams: 'com.microsoft.teams2',
+  'teams-for-linux': 'com.microsoft.teams2', discord: 'com.hnc.Discord',
+};
+function parseMeetingApps(outputs) {
+  const result = new Map();
+  for (const output of outputs) {
+    const p = output.properties || {};
+    if (output.corked || p['application.id'] === 'com.granola.app') continue;
+    const binary = String(p['application.process.binary'] || '').split('/').pop().toLowerCase();
+    const bundleId = meetingApps[binary];
+    if (!bundleId) continue;
+    const pid = Number(p['application.process.id']) || 0;
+    result.set(bundleId, {bundleId, pid, deviceUID: `pulse:${output.source}`});
+  }
+  return [...result.values()].sort((a, b) => a.bundleId.localeCompare(b.bundleId));
+}
+function subscribeMeetings(callback, {command = execute, every = setInterval, cancel = clearInterval} = {}) {
+  let stopped = false, pending = false, last, warned = false;
+  const tick = async () => {
+    if (stopped || pending) return;
+    pending = true;
+    try {
+      const apps = parseMeetingApps(JSON.parse(await command('pactl', ['--format=json', 'list', 'source-outputs'])));
+      const key = JSON.stringify(apps);
+      if (!stopped && key !== last) { last = key; callback(apps); }
+    } catch (error) {
+      if (!warned) { warned = true; console.warn('[granola-linux] meeting detection:', error.message); }
+      if (!stopped && last !== '[]') { last = '[]'; callback([]); }
+    } finally { pending = false; }
+  };
+  const timer = every(tick, 1500);
+  timer?.unref?.();
+  tick();
+  return () => { stopped = true; cancel(timer); };
+}
+let capture;
+function handle(message, emit) {
+  if (!capture) {
+    capture = createCapture({emit});
+    process.once('exit', () => capture.stop());
+  }
+  capture.handle(message).catch(error => console.error('[granola-linux] capture:', error));
+}
+async function microphonePermission(callback) {
+  try { await execute('pactl', ['info']); callback(true); }
+  catch { callback(false); }
+}
+module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission};
+EOF
+}
+
+patch_linux_runtime() {
+  local stage=$1
+  emit_linux_runtime >"$stage/resources/granola-linux.cjs"
+  python3 -I - "$stage/resources/app.asar" <<'EOF'
+import hashlib, json, pathlib, re, struct, sys
+p = pathlib.Path(sys.argv[1])
+data = p.read_bytes()
+_, header_size, _, json_size = struct.unpack('<4I', data[:16])
+header = json.loads(data[16:16 + json_size])
+blob = data[8 + header_size:]
+def entries(node):
+    for entry in node['files'].values():
+        if 'files' in entry:
+            yield from entries(entry)
+        elif 'offset' in entry and not entry.get('unpacked'):
+            yield entry
+def content(entry):
+    return blob[int(entry['offset']):int(entry['offset']) + entry['size']]
+pkg = json.loads(content(header['files']['package.json']))
+main = header
+for component in pkg['main'].split('/'):
+    main = main['files'][component]
+source = content(main).decode()
+marker = 'GRANOLA_LINUX_CAPTURE'
+if marker not in source:
+    runtime = 'require(process.resourcesPath+`/granola-linux.cjs`)'
+    audio = re.compile(r'function (?P<send>[\w$]+)\((?P<arg>[\w$]+)\)\{(?P<broadcast>[\w$]+)\(`to-audio-process`,(?P=arg)\)\}function (?P<receive>[\w$]+)\(')
+    permission = re.compile(r'async function (?P<name>[\w$]+)\((?P<cb>[\w$]+)\)\{(?P=cb)\(await (?P<electron>[\w$]+)\.systemPreferences\.askForMediaAccess\(`microphone`\)\)\}')
+    monitor = re.compile(r'function (?P<name>[\w$]+)\(\)\{return process\.platform===`darwin`\?(?P<mac>[^{};]+):process\.platform===`win32`\?(?P<win>[\w$]+):(?P<cb>[\w$]+)=>\((?P=cb)\(\[\]\),\(\)=>\{\}\)\}')
+    if any(len(list(pattern.finditer(source))) != 1 for pattern in (audio, permission, monitor)):
+        raise SystemExit('Granola audio/meeting observer changed; review before updating this app version')
+    source = audio.sub(lambda m: f'function {m["send"]}({m["arg"]}){{if(process.platform===`linux`)return {runtime}.handle({m["arg"]},{m["receive"]});{m["broadcast"]}(`to-audio-process`,{m["arg"]})}}function {m["receive"]}(', source)
+    source = permission.sub(lambda m: f'async function {m["name"]}({m["cb"]}){{if(process.platform===`linux`)return {runtime}.microphonePermission({m["cb"]});{m["cb"]}(await {m["electron"]}.systemPreferences.askForMediaAccess(`microphone`))}}', source)
+    source = monitor.sub(lambda m: f'function {m["name"]}(){{if(process.platform===`linux`)return {runtime}.subscribeMeetings;return process.platform===`darwin`?{m["mac"]}:process.platform===`win32`?{m["win"]}:{m["cb"]}=>({m["cb"]}([]),()=>{{}})}}', source)
+    replacement = (source + f'\n/*{marker}*/\n').encode()
+    # Rebuild offsets and changed-file integrity rather than overwriting bytes
+    # past an ASAR entry. Every other packed file is copied byte for byte.
+    packed = bytearray()
+    for entry in sorted(entries(header), key=lambda entry: int(entry['offset'])):
+        value = replacement if entry is main else content(entry)
+        entry['offset'] = str(len(packed))
+        entry['size'] = len(value)
+        if 'integrity' in entry:
+            integrity = entry['integrity']
+            block = integrity['blockSize']
+            integrity['hash'] = hashlib.sha256(value).hexdigest()
+            integrity['blocks'] = [hashlib.sha256(value[i:i + block]).hexdigest() for i in range(0, len(value), block)]
+        packed.extend(value)
+    encoded = json.dumps(header, separators=(',', ':'), ensure_ascii=False).encode()
+    padded = encoded + b'\0' * (-len(encoded) % 4)
+    p.write_bytes(struct.pack('<4I', 4, 8 + len(padded), 4 + len(padded), len(encoded)) + padded + packed)
+print('    Linux PCM capture, microphone permission and meeting observer prepared')
+EOF
+}
+
+# A network-free entry point for distribution packages, after their toolchain
+# has rebuilt SQLite and assembled the matching Electron/Granola versions.
+cmd_prepare() {
+  local stage=${1:?prepare needs an assembled app directory}
+  [[ -f "$stage/resources/app.asar" ]] || die "no app.asar in $stage/resources"
+  patch_asar "$stage/resources/app.asar"
+  patch_click_drag "$stage/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin"
+  patch_tray_icons "$stage/resources/icons"
+  patch_linux_runtime "$stage"
+  node --check "$stage/resources/granola-linux.cjs"
+}
+
+# Granola's JS wrapper calls updateHook(operation, database, table, rowid), but
+# newer images ship no private C++ sources. Supply that API over SQLite's own
+# update hook in the matching MIT-licensed public module. Keep encryption,
+# transactions and query handling in upstream SQLite; callbacks cannot outlive
+# their database and callback exceptions interrupt/propagate the SQL operation.
+cmd_prepare_sqlite() {
+  python3 -I - "${1:?prepare-sqlite needs an unpacked SQLite source directory}" <<'EOF'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1]) / 'src/objects'
+header = root / 'database.hpp'
+source = root / 'database.cpp'
+h, s = header.read_text(), source.read_text()
+# Electron 45's V8 15.6 removes the transitional V2 APIs and requires an
+# explicit external-pointer tag. Keep older Electron builds on their original
+# API paths while compiling this exact public source against current headers.
+macros = root.parent / 'util/macros.cpp'
+entry = root.parent / 'better_sqlite3.cpp'
+if 'GRANOLA_V8_COMPAT' not in macros.read_text():
+    cpp = entry.read_text()
+    if cpp.count('v8::External::New(isolate, addon)') != 1:
+        raise SystemExit('SQLite external pointer setup changed; review V8 compatibility')
+    compatibility = r'''
+/* GRANOLA_V8_COMPAT */
+#if V8_MAJOR_VERSION > 15 || (V8_MAJOR_VERSION == 15 && V8_MINOR_VERSION >= 6)
+#undef GET_PROTOTYPE
+#define GET_PROTOTYPE(obj) ((obj)->GetPrototype())
+#undef PROPERTY_HOLDER
+#define PROPERTY_HOLDER(info) (info).Holder()
+#undef OnlyAddon
+#define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault))
+#define GRANOLA_EXTERNAL_NEW(isolate, value) v8::External::New(isolate, value, v8::kExternalPointerTypeTagDefault)
+#else
+#define GRANOLA_EXTERNAL_NEW(isolate, value) v8::External::New(isolate, value)
+#endif
+'''
+    macros.write_text(macros.read_text() + compatibility)
+    entry.write_text(cpp.replace('v8::External::New(isolate, addon)', 'GRANOLA_EXTERNAL_NEW(isolate, addon)'))
+# SQLite's truncate shortcut skips per-row update hooks on a full-table DELETE.
+# Disable that optimization so Granola's table-change cache is invalidated for
+# bulk deletes as well as inserts and targeted updates/deletes.
+defines = root.parent.parent / 'deps/defines.gypi'
+d = defines.read_text()
+if 'SQLITE_OMIT_TRUNCATE_OPTIMIZATION' not in d:
+    if d.count("'defines': [") != 1:
+        raise SystemExit('SQLite build definitions changed; review change notifications')
+    defines.write_text(d.replace("'defines': [", "'defines': [\n    'SQLITE_OMIT_TRUNCATE_OPTIMIZATION',"))
+# Granola's renderer uses SQLite's built-in tables_used() virtual table to
+# subscribe live queries to table changes. Without this build option every
+# screen, including login, falls into the React error boundary.
+d = defines.read_text()
+if 'SQLITE_ENABLE_BYTECODE_VTAB' not in d:
+    if d.count("'defines': [") != 1:
+        raise SystemExit('SQLite build definitions changed; review live queries')
+    defines.write_text(d.replace("'defines': [", "'defines': [\n    'SQLITE_ENABLE_BYTECODE_VTAB',"))
+if 'JS_updateHook' in s:
+    print('    SQLite updateHook already present')
+    raise SystemExit(0)
+anchors = [
+    (h, '\tstatic NODE_METHOD(JS_close);'),
+    (h, '\tstd::set<Backup*, CompareBackup> backups;'),
+    (s, '\tSetPrototypeMethod(isolate, data, t, "close", JS_close);'),
+    (s, '\t\tbackups.clear();\n\t\tint status = sqlite3_close(db_handle);'),
+    (s, 'NODE_METHOD(Database::JS_close) {'),
+]
+if any(text.count(anchor) != 1 for text, anchor in anchors):
+    raise SystemExit('SQLite source layout changed; review the updateHook adapter')
+h = h.replace('\tstatic NODE_METHOD(JS_close);', '\tstatic NODE_METHOD(JS_updateHook);\n\tstatic void UpdateHook(void*, int, const char*, const char*, sqlite3_int64);\n\tstatic NODE_METHOD(JS_close);')
+h = h.replace('\tstd::set<Backup*, CompareBackup> backups;', '\tstd::set<Backup*, CompareBackup> backups;\n\tv8::Global<v8::Function> update_hook;\n\tv8::Global<v8::Context> update_context;\n\tv8::Global<v8::Value> update_exception;')
+s = s.replace('\tSetPrototypeMethod(isolate, data, t, "close", JS_close);', '\tSetPrototypeMethod(isolate, data, t, "updateHook", JS_updateHook);\n\tSetPrototypeMethod(isolate, data, t, "close", JS_close);')
+s = s.replace('\t\tbackups.clear();\n\t\tint status = sqlite3_close(db_handle);', '\t\tbackups.clear();\n\t\tsqlite3_update_hook(db_handle, NULL, NULL);\n\t\tupdate_hook.Reset();\n\t\tupdate_context.Reset();\n\t\tupdate_exception.Reset();\n\t\tint status = sqlite3_close(db_handle);')
+s = s.replace('if (was_js_error) was_js_error = false;', '''if (was_js_error) {
+        was_js_error = false;
+        if (!update_exception.IsEmpty()) {
+            EasyIsolate;
+            auto error = update_exception.Get(isolate);
+            update_exception.Reset();
+            isolate->ThrowException(error);
+        }
+    }''')
+s = s.replace('if (status != SQLITE_OK) break;', 'if (status != SQLITE_OK || db->was_js_error) break;')
+s = s.replace('db->busy = false;\n\tif (status != SQLITE_OK) {', 'db->busy = false;\n\tif (status != SQLITE_OK || db->was_js_error) {')
+implementation = r'''
+NODE_METHOD(Database::JS_updateHook) {
+    UseIsolate;
+    Database* db = Unwrap<Database>(info.This());
+    REQUIRE_DATABASE_OPEN(db);
+    REQUIRE_DATABASE_NOT_BUSY(db);
+    if (info.Length() == 0 || info[0]->IsNullOrUndefined()) {
+        sqlite3_update_hook(db->db_handle, NULL, NULL);
+        db->update_hook.Reset();
+        db->update_context.Reset();
+    } else {
+        if (!info[0]->IsFunction()) { ThrowTypeError("updateHook expects a function or null"); return; }
+        db->update_hook.Reset(isolate, info[0].As<v8::Function>());
+        db->update_context.Reset(isolate, OnlyContext);
+        sqlite3_update_hook(db->db_handle, UpdateHook, db);
+    }
+}
+
+void Database::UpdateHook(void* opaque, int operation, const char* database, const char* table, sqlite3_int64 rowid) {
+    Database* db = static_cast<Database*>(opaque);
+    if (!db->open || db->update_hook.IsEmpty()) return;
+    EasyIsolate;
+    v8::HandleScope scope(isolate);
+    auto context = db->update_context.Get(isolate);
+    v8::Context::Scope context_scope(context);
+    v8::Local<v8::Value> id;
+    if (db->safe_ints) id = v8::BigInt::New(isolate, rowid);
+    else id = v8::Number::New(isolate, static_cast<double>(rowid));
+    v8::Local<v8::Value> args[] = {
+        v8::Integer::New(isolate, operation),
+        StringFromUtf8(isolate, database, -1),
+        StringFromUtf8(isolate, table, -1), id
+    };
+    v8::TryCatch caught(isolate);
+    if (db->update_hook.Get(isolate)->Call(context, v8::Undefined(isolate), 4, args).IsEmpty()) {
+        db->update_exception.Reset(isolate, caught.Exception());
+        db->was_js_error = true;
+        sqlite3_interrupt(db->db_handle);
+    }
+}
+
+'''
+s = s.replace('NODE_METHOD(Database::JS_close) {', implementation + 'NODE_METHOD(Database::JS_close) {')
+header.write_text(h)
+source.write_text(s)
+query = root.parent / 'util/query-macros.cpp'
+q = query.read_text()
+anchor = '\tinfo.GetReturnValue().Set(return_value);'
+if q.count(anchor) != 1:
+    raise SystemExit('SQLite statement return path changed; review callback errors')
+guard = '\tif (stmt->db->GetState()->was_js_error) { \\\n\t\tstmt->db->ThrowDatabaseError(); \\\n\t\tif (!bound) { sqlite3_clear_bindings(handle); } \\\n\t\treturn; \\\n\t} \\\n'
+query.write_text(q.replace(anchor, guard + anchor))
+iterator = root / 'statement-iterator.cpp'
+it = iterator.read_text()
+anchor = '\tdb_state->busy = false;\n\tif (status == SQLITE_ROW) {'
+if it.count(anchor) != 1:
+    raise SystemExit('SQLite iterator return path changed; review callback errors')
+iterator.write_text(it.replace(anchor, '\tdb_state->busy = false;\n\tif (db_state->was_js_error) status = SQLITE_ERROR;\n\tif (status == SQLITE_ROW) {'))
+print('    SQLite updateHook adapter prepared')
+EOF
+}
+
+cmd_check_runtime() (
+  local test_dir
+  test_dir=$(mktemp -d)
+  trap 'rm -rf "$test_dir"' EXIT
+  emit_linux_runtime >"$test_dir/runtime.cjs"
+  node --check "$test_dir/runtime.cjs"
+  node - "$test_dir/runtime.cjs" <<'EOF'
+const assert = require('node:assert/strict');
+const {EventEmitter} = require('node:events');
+const {createCapture, parseMeetingApps, subscribeMeetings} = require(process.argv[2]);
+const flush = () => new Promise(resolve => setImmediate(resolve));
+function setup(command) {
+  const children = [], events = [], timers = [];
+  let cancelled = 0;
+  const capture = createCapture({emit: event => events.push(event), env: {},
+    command: command || (async (_command, args) => args[0] === 'get-default-source' ? 'mic' : 'speaker'),
+    launch(binary, args) {
+      assert.equal(binary, 'parec');
+      assert(args.includes('--format=s16le') && args.includes('--channels=1'));
+      const child = new EventEmitter();
+      child.args = args;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => { child.killed = true; child.emit('exit', 0, 'SIGTERM'); };
+      children.push(child);
+      return child;
+    },
+    every(tick) { timers.push(tick); return {unref() {}}; },
+    cancel() { cancelled++; },
+  });
+  return {capture, children, events, timers, get cancelled() { return cancelled; }};
+}
+(async () => {
+  const t = setup();
+  assert.equal(t.children.length, 0, 'loading the module activated audio');
+  await t.capture.start(16000);
+  assert.equal(t.children.length, 2);
+  assert(t.children[0].args.includes('--device=mic'));
+  assert(t.children[1].args.includes('--device=speaker.monitor'));
+  t.children[0].stdout.emit('data', Buffer.alloc(1111));
+  t.children[0].stdout.emit('data', Buffer.alloc(5289));
+  t.children[1].stdout.emit('data', Buffer.alloc(3200));
+  const buffers = t.events.filter(e => e.event === 'audio-capture-buffer');
+  assert.equal(buffers.length, 3, 'PCM fragments were lost or combined across sources');
+  assert.equal(buffers[0].microphoneBuffer.length, 3200);
+  assert.equal(buffers[0].systemAudioBuffer, null);
+  assert.equal(buffers[2].microphoneBuffer, null);
+  assert.equal(buffers[2].systemAudioBuffer.length, 3200);
+  t.capture.stop();
+  assert(t.children.every(child => child.killed));
+  assert.equal(t.cancelled, 1);
+  const count = t.events.length;
+  t.children[0].stdout.emit('data', Buffer.alloc(3200));
+  assert.equal(t.events.length, count, 'stopped capture emitted late audio');
+  await t.capture.start(16000);
+  t.children[2].emit('error', Error('device missing'));
+  t.children[2].emit('exit', 1);
+  assert.equal(t.events.filter(e => e.event === 'audio-capture-source-error').length, 1);
+  t.capture.stop();
+
+  let sink = 'before';
+  const switched = setup(async (_binary, args) => args[0] === 'get-default-source' ? 'mic' : sink);
+  await switched.capture.start(16000);
+  sink = 'after';
+  await switched.timers[0]();
+  assert.equal(switched.children.length, 3, 'default output change did not replace system stream');
+  assert(!switched.children[0].killed, 'output change restarted microphone');
+  assert(switched.children[1].killed);
+  assert(switched.children[2].args.includes('--device=after.monitor'));
+  switched.capture.stop();
+
+  let resolveDevice;
+  // Use fixed system source so only one asynchronous query is pending.
+  const lateChildren = [];
+  const late = createCapture({emit() {}, env: {GRANOLA_LINUX_SYSTEM_SOURCE: 'test.monitor'},
+    command: () => new Promise(resolve => { resolveDevice = resolve; }),
+    launch() { lateChildren.push('unexpected'); throw Error('late recorder started'); }});
+  const starting = late.start(16000);
+  late.stop();
+  resolveDevice('mic');
+  await starting;
+  assert.deepEqual(lateChildren, [], 'stop during device discovery activated recording');
+  assert(!late.active);
+
+  const row = (binary, extra = {}) => ({source: 4, properties: {
+    'application.process.binary': binary, 'application.process.id': '42', ...extra}});
+  const apps = parseMeetingApps([row('helium'), row('helium'), row('zoom'),
+    {...row('slack'), corked: true}, row('granola'), row('firefox', {'application.id': 'com.granola.app'})]);
+  assert.deepEqual(apps.map(app => app.bundleId), ['com.google.Chrome', 'us.zoom.xos']);
+  const updates = [];
+  let tick, stopTimer = false;
+  const unsubscribe = subscribeMeetings(apps => updates.push(apps), {
+    command: async () => JSON.stringify([row('helium')]),
+    every(fn) { tick = fn; return {unref() {}}; }, cancel() { stopTimer = true; },
+  });
+  await flush();
+  await tick();
+  assert.equal(updates.length, 1, 'unchanged meeting evidence was republished');
+  unsubscribe();
+  await tick();
+  assert(stopTimer && updates.length === 1, 'unsubscribe left detection active');
+  console.log('Linux runtime: PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+EOF
+)
+
+# Refresh distribution inputs independently of installation. Electron and its
+# headers are verified against their release checksums, npm against its SRI.
+# Granola publishes no checksum: record its official immutable release URL and
+# the downloaded image's SHA-256 so subsequent builds reject changed bytes.
+cmd_pin() (
+  local target=${1:-sources.json} work dmg app_ver el_ver mod_ver name url want
+  for name in curl python3 sha256sum; do need_cmd "$name"; done
+  mkdir -p "$CACHE_DIR"
+  SEVENZIP=$(find_sevenzip)
+  resolve_latest
+  work=$(mktemp -d "$CACHE_DIR/pin.XXXXXX")
+  trap 'rm -rf "$work"' EXIT
+  dmg="$CACHE_DIR/$(basename "$LATEST_URL_RESOLVED")"
+  [[ -f "$dmg" ]] || fetch "$dmg" "$LATEST_URL_RESOLVED"
+  dmg_extract "$dmg" "$DMG_APP/Info.plist" "$work/app" || die "no app version in image"
+  dmg_extract "$dmg" "$DMG_FRAMEWORK_PLIST" "$work/electron" || die "no Electron version in image"
+  dmg_extract "$dmg" "$DMG_RES/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/package.json" "$work/sqlite" || die "no SQLite metadata in image"
+  app_ver=$(plist_string "$work/app/Info.plist" CFBundleShortVersionString)
+  el_ver=$(plist_string "$work/electron/Info.plist" CFBundleVersion)
+  mod_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$work/sqlite/package.json")
+  [[ -n "$app_ver" && -n "$el_ver" && -n "$mod_ver" ]] || die "could not determine source versions"
+  fetch "$work/electron-sums" "$ELECTRON_RELEASES/v$el_ver/SHASUMS256.txt"
+  fetch "$work/header-sums" "$ELECTRON_HEADERS/v$el_ver/SHASUMS256.txt"
+  for name in "electron-v$el_ver-linux-x64.zip" "node-v$el_ver-headers.tar.gz"; do
+    if [[ "$name" == electron-* ]]; then
+      url="$ELECTRON_RELEASES/v$el_ver/$name"
+      want=$(awk -v file="$name" '$2 == file || $2 == "*" file { print $1 }' "$work/electron-sums")
+    else
+      url="$ELECTRON_HEADERS/v$el_ver/$name"
+      want=$(awk -v file="$name" '$2 == file || $2 == "*" file { print $1 }' "$work/header-sums")
+    fi
+    [[ -n "$want" ]] || die "no published checksum for $name"
+    [[ -f "$CACHE_DIR/$name" ]] || fetch "$CACHE_DIR/$name" "$url"
+    check_sha256 "$CACHE_DIR/$name" "$want"
+  done
+  name="better-sqlite3-multiple-ciphers-$mod_ver.tgz"
+  url="https://registry.npmjs.org/better-sqlite3-multiple-ciphers/-/$name"
+  fetch "$work/sqlite-metadata.json" "https://registry.npmjs.org/better-sqlite3-multiple-ciphers/$mod_ver"
+  [[ -f "$CACHE_DIR/$name" ]] || fetch "$CACHE_DIR/$name" "$url"
+  python3 -I - "$target" "$CACHE_DIR" "$dmg" "$app_ver" "$el_ver" "$mod_ver" "$work/sqlite-metadata.json" <<'EOF'
+import base64, hashlib, json, pathlib, sys
+target, cache, dmg, version, electron, sqlite, metadata = sys.argv[1:]
+cache = pathlib.Path(cache)
+sqlite_file = cache / f'better-sqlite3-multiple-ciphers-{sqlite}.tgz'
+integrity = json.loads(pathlib.Path(metadata).read_text())['dist']['integrity']
+algorithm, expected = integrity.split('-', 1)
+if base64.b64encode(hashlib.new(algorithm, sqlite_file.read_bytes()).digest()).decode() != expected:
+    raise SystemExit('npm SQLite source integrity mismatch')
+files = {
+    'dmg': (pathlib.Path(dmg), f'https://dr2v7l5emb758.cloudfront.net/{version}/Granola-{version}-mac-universal.dmg'),
+    'electron': (cache / f'electron-v{electron}-linux-x64.zip', f'https://github.com/electron/electron/releases/download/v{electron}/electron-v{electron}-linux-x64.zip'),
+    'headers': (cache / f'node-v{electron}-headers.tar.gz', f'https://electronjs.org/headers/v{electron}/node-v{electron}-headers.tar.gz'),
+    'sqlite-gyp': (sqlite_file, f'https://registry.npmjs.org/better-sqlite3-multiple-ciphers/-/better-sqlite3-multiple-ciphers-{sqlite}.tgz'),
+}
+manifest = {'version': version, 'electronVersion': electron, 'sqliteVersion': sqlite, 'sources': {}}
+for name, (file, url) in files.items():
+    digest = base64.b64encode(hashlib.sha256(file.read_bytes()).digest()).decode()
+    manifest['sources'][name] = {'url': url, 'hash': 'sha256-' + digest}
+pathlib.Path(target).write_text(json.dumps(manifest, indent=2) + '\n')
+print(f'Pinned Granola {version}, Electron {electron}, SQLite {sqlite} in {target}')
+EOF
+)
 
 write_desktop_entry() {
   mkdir -p "$(dirname "$DESKTOP_FILE")"
@@ -606,6 +1193,11 @@ main() {
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     status) cmd_status "$@" ;;
+    prepare) cmd_prepare "$@" ;;
+    prepare-sqlite) cmd_prepare_sqlite "$@" ;;
+    emit-runtime) emit_linux_runtime ;;
+    check-runtime) cmd_check_runtime ;;
+    pin) cmd_pin "$@" ;;
     help|-h|--help) usage ;;
     --version) echo "granola-linux $VERSION" ;;
     *) usage >&2; die "unknown command: $cmd" ;;

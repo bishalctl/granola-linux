@@ -1,5 +1,10 @@
 # granola-linux
 
+This fork maintains Linux meeting capture and detection alongside the official
+Granola application. Google Calendar, sign-in, sync, and integrations continue
+to use Granola's own application and services. Account access and integration
+permissions still belong to the signed-in user.
+
 `granola-linux` installs [Granola](https://www.granola.ai), the AI meeting
 notepad, on a Linux desktop. Granola publishes builds for macOS and Windows
 only. Its macOS disk image, however, is an Electron bundle: the app itself is
@@ -27,7 +32,7 @@ checksum pinned in the script. The `p7zip` most distributions still ship
 cannot read the image's compression.
 
 ```sh
-git clone https://github.com/cacarico/granola-linux
+git clone https://github.com/bishalctl/granola-linux
 cd granola-linux
 make install DRY_RUN=1   # prints what would happen, changes nothing
 make install             # installs the current release
@@ -48,6 +53,15 @@ link; the install registers the handler for it.
 - `make uninstall` removes the app and keeps your notes.
   `./granola-linux uninstall --purge` removes Granola's data too.
 
+For reproducible distribution builds, `sources.json` pins Granola, its matching
+Electron runtime and headers, and the SQLite binding metadata by URL and
+SHA-256. Run `./granola-linux pin sources.json` to refresh that manifest from
+Granola's current full release. This verifies Electron's published checksums
+and npm's integrity metadata; Granola publishes no image checksum, so the
+manifest records the downloaded image's digest. Review and commit the updated
+manifest, then update the distribution's pinned revision of this repository.
+The app does not replace a package-managed installation from inside Electron.
+
 Everything is written as your user: the app under
 `~/.local/share/granola-linux`, downloads under `~/.cache/granola-linux`, and
 Granola's own data under `~/.config/Granola`, where the official app keeps it.
@@ -65,10 +79,17 @@ Wayland.
 
 Some things are different from the macOS build:
 
-- Capture of the other side of a call. On macOS Granola taps system audio
-  through Core Audio. The Linux runtime has no such path, so the launcher
-  turns on Chromium's PipeWire capturer and the app records what the desktop
-  portal offers it.
+- Meeting capture uses two PulseAudio PCM streams (including PipeWire's
+  PulseAudio compatibility service): the default microphone and the default
+  output's monitor. Both feed the app's existing transcription pipeline.
+  Install `pactl` and `parec` from your distribution's PulseAudio tools package.
+  Capture starts only when Granola requests a recording, stops both streams
+  when it ends, and follows default device changes while recording. Use
+  `GRANOLA_LINUX_MIC_SOURCE` or `GRANOLA_LINUX_SYSTEM_SOURCE` to select explicit
+  PulseAudio source names. This avoids Electron's Windows-only loopback path.
+- Meeting detection observes active microphone streams and recognizes common
+  browsers (including Helium), Zoom, Teams, Slack, and Discord. It publishes
+  meeting evidence to Granola's observer; it does not itself start recordings.
 - Granola's auto-update is off. The installed version is pinned; `make
   status` tells you when a new release is out and `make install` brings it
   in.
@@ -99,12 +120,15 @@ renamed `granola`, because an Electron binary called `electron` reports the
 app as unpackaged and Granola then runs with developer tooling and a "Not
 packaged" tray menu.
 
-**The SQLite module.** Granola uses a fork of `better-sqlite3-multiple-ciphers`
-with an `updateHook` method that no published build has. The fork's C++
-source ships in the image; only `binding.gyp` is missing, and npm supplies it
-from the release of the same version. The module is compiled against the
-Electron headers for the installed runtime, with the newest `g++` of version
-11 or later on the system.
+**The SQLite module.** Granola uses `better-sqlite3-multiple-ciphers` with an
+additional `updateHook` method. Older images include that fork's C++ sources;
+newer images omit them. When they are absent, the matching public module is
+built with a small adapter over SQLite's `sqlite3_update_hook` API. It reports
+operation, database, table, and row ID, unregisters on close, and propagates
+callback errors through the executing statement. Encryption and queries stay
+in the upstream library. `prepare-sqlite DIR` adds the adapter to an unpacked
+public source tree for distribution builds. The module is compiled against
+the exact Electron headers used by the app.
 
 **The patches.**
 
@@ -132,6 +156,15 @@ display. Only then is the new app swapped into place, so a failed build never
 replaces a working one. If the system restricts unprivileged user namespaces,
 which Chromium's sandbox needs, the script prints the root command that
 enables the setuid sandbox helper rather than running anything as root.
+
+Distribution packages can assemble the matching Electron runtime and rebuild
+SQLite with their own toolchain, then run `./granola-linux prepare APPDIR`.
+This applies the same compatibility changes without network access or writing
+launchers into a user's home directory. The Linux audio adapter is generated
+from this script; there is no vendored copy of Granola's application code.
+`make check` also tests PCM framing, independent sources, cancellation during
+device discovery, stream cleanup, device changes, and meeting detection with
+isolated process fixtures. It does not open the microphone or contact Granola.
 
 ## Safety and terms
 

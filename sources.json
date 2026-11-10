@@ -1,0 +1,23 @@
+{
+  "version": "7.774.2",
+  "electronVersion": "45.2.1",
+  "sqliteVersion": "12.9.0",
+  "sources": {
+    "dmg": {
+      "url": "https://dr2v7l5emb758.cloudfront.net/7.774.2/Granola-7.774.2-mac-universal.dmg",
+      "hash": "sha256-63C5UXZLpS1XOjYclKyu3QGugIp/HQZwJNXtKEjShTs="
+    },
+    "electron": {
+      "url": "https://github.com/electron/electron/releases/download/v45.2.1/electron-v45.2.1-linux-x64.zip",
+      "hash": "sha256-YW78GuR4SvGk8/Dod05z5wMOe9FwjanQm89UPfpJm+s="
+    },
+    "headers": {
+      "url": "https://electronjs.org/headers/v45.2.1/node-v45.2.1-headers.tar.gz",
+      "hash": "sha256-3nz9S47o0Y7qiGRNRRT+WUTalxaGY8dFh1imOm/Ofu4="
+    },
+    "sqlite-gyp": {
+      "url": "https://registry.npmjs.org/better-sqlite3-multiple-ciphers/-/better-sqlite3-multiple-ciphers-12.9.0.tgz",
+      "hash": "sha256-rYzrLP5ofgwQZUf90oHw0gtAaIIA0E9AuxY6/R8QJgk="
+    }
+  }
+}
