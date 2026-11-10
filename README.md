@@ -137,6 +137,10 @@ the exact Electron headers used by the app.
   to say `Windows`, with the same byte length, since the archive header
   records every file's offset. This is what the API sees, so Granola's own
   device list may show the install as Windows.
+- Startup links. Linux desktop handlers pass a `granola:` URL in the command
+  line rather than delivering macOS's `open-url` event. The app now feeds a
+  cold-start link through Granola's existing URL parser, duplicate guard and
+  pending-link dispatcher, retaining its validation and account routing.
 - The echo-cancellation notice. Granola cancels echo through Core Audio on
   macOS and treats every other platform as Windows, so the transcript view
   would say the feature is in beta on Windows. The notice stays, since it is

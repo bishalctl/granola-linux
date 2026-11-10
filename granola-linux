@@ -527,6 +527,14 @@ const {spawn, execFile, execFileSync} = require('node:child_process');
 // Let the compositor own mapped tiles; retain native sizing for floating
 // windows, XWayland, other desktops and every secondary/notification window.
 const managedPrimaryWindows = new WeakSet();
+// macOS delivers cold-start URLs through open-url. Linux desktop handlers
+// deliver them in argv instead. Use Granola's own parser, duplicate guard and
+// pending-link dispatcher so login callbacks and note links take the same path.
+function handleStartupLink(argv, {platform = process.platform, parse, accept, open}) {
+  if (platform !== 'linux') return;
+  const url = parse(argv);
+  if (url && accept(url)) open(url);
+}
 function managePrimaryWindow(window, {platform = process.platform, env = process.env,
     pid = process.pid, query = () => execFileSync('hyprctl', ['-j', 'clients'],
       {encoding: 'utf8', timeout: 500, maxBuffer: 8 * 1024 * 1024,
@@ -739,7 +747,7 @@ async function microphonePermission(callback) {
   try { await execute('pactl', ['info']); callback(true); }
   catch { callback(false); }
 }
-module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow};
+module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow, handleStartupLink};
 EOF
 }
 
@@ -773,12 +781,16 @@ if marker not in source:
     permission = re.compile(r'async function (?P<name>[\w$]+)\((?P<cb>[\w$]+)\)\{(?P=cb)\(await (?P<electron>[\w$]+)\.systemPreferences\.askForMediaAccess\(`microphone`\)\)\}')
     monitor = re.compile(r'function (?P<name>[\w$]+)\(\)\{return process\.platform===`darwin`\?(?P<mac>[^{};]+):process\.platform===`win32`\?(?P<win>[\w$]+):(?P<cb>[\w$]+)=>\((?P=cb)\(\[\]\),\(\)=>\{\}\)\}')
     primary = re.compile(r'let (?P<win>[\w$]+)=[\w$]+;(?P=win)&&(?P=win)\.on\(`close`,')
-    if any(len(list(pattern.finditer(source))) != 1 for pattern in (audio, permission, monitor, primary)):
+    link_args = re.compile(r'\.app\.on\(`second-instance`,async\([\w$]+,(?P<args>[\w$]+)\)=>\{if\([\w$]+\((?P=args)\)\)return;let (?P<url>[\w$]+)=(?P<parse>[\w$]+)\((?P=args)\),[\w$]+=(?P=url)&&(?P<accept>[\w$]+)\((?P=url)\)\?(?P=url):null;')
+    link_dispatch = re.compile(r'function (?P<open>[\w$]+)\((?P<url>[\w$]+)\)\{if\(!(?P<win>[\w$]+)\|\|(?P=win)\.isDestroyed\(\)\|\|(?P=win)\.webContents\.getURL\(\)===``\)\{[\w$]+\((?P=url)\);return\}[\w$]+\((?P=url)\)\}')
+    if any(len(list(pattern.finditer(source))) != 1 for pattern in (audio, permission, monitor, primary, link_args, link_dispatch)):
         raise SystemExit('Granola audio/meeting/primary-window setup changed; review before updating this app version')
     source = audio.sub(lambda m: f'function {m["send"]}({m["arg"]}){{if(process.platform===`linux`)return {runtime}.handle({m["arg"]},{m["receive"]});{m["broadcast"]}(`to-audio-process`,{m["arg"]})}}function {m["receive"]}(', source)
     source = permission.sub(lambda m: f'async function {m["name"]}({m["cb"]}){{if(process.platform===`linux`)return {runtime}.microphonePermission({m["cb"]});{m["cb"]}(await {m["electron"]}.systemPreferences.askForMediaAccess(`microphone`))}}', source)
     source = monitor.sub(lambda m: f'function {m["name"]}(){{if(process.platform===`linux`)return {runtime}.subscribeMeetings;return process.platform===`darwin`?{m["mac"]}:process.platform===`win32`?{m["win"]}:{m["cb"]}=>({m["cb"]}([]),()=>{{}})}}', source)
     source = primary.sub(lambda m: m[0].replace(f';{m["win"]}&&', f';if(process.platform===`linux`){runtime}.managePrimaryWindow({m["win"]});{m["win"]}&&'), source)
+    args, dispatcher = link_args.search(source), link_dispatch.search(source)
+    source += f'\nif(process.platform===`linux`){runtime}.handleStartupLink(process.argv,{{parse:{args["parse"]},accept:{args["accept"]},open:{dispatcher["open"]}}});\n'
     replacement = (source + f'\n/*{marker}*/\n').encode()
     # Rebuild offsets and changed-file integrity rather than overwriting bytes
     # past an ASAR entry. Every other packed file is copied byte for byte.
@@ -965,7 +977,7 @@ cmd_check_runtime() (
   node - "$test_dir/runtime.cjs" <<'EOF'
 const assert = require('node:assert/strict');
 const {EventEmitter} = require('node:events');
-const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow} = require(process.argv[2]);
+const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow, handleStartupLink} = require(process.argv[2]);
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function setup(command) {
   const children = [], events = [], timers = [];
@@ -989,6 +1001,16 @@ function setup(command) {
   return {capture, children, events, timers, get cancelled() { return cancelled; }};
 }
 (async () => {
+  const opened = [], seen = new Set();
+  const startup = {platform: 'linux', parse: args => args.find(x => x.startsWith('granola://')),
+    accept: url => { if (seen.has(url)) return false; seen.add(url); return true; }, open: url => opened.push(url)};
+  handleStartupLink(['granola'], startup);
+  handleStartupLink(['granola', 'granola://open-document?document_id=test'], startup);
+  handleStartupLink(['granola', 'granola://open-document?document_id=test'], startup);
+  handleStartupLink(['granola', 'granola://login-complete?code=fixture'], startup);
+  handleStartupLink(['granola', 'granola://open-document?document_id=mac'], {...startup, platform: 'darwin'});
+  handleStartupLink(['granola', 'granola://open-document?document_id=windows'], {...startup, platform: 'win32'});
+  assert.deepEqual(opened, ['granola://open-document?document_id=test', 'granola://login-complete?code=fixture']);
   const nativeBounds = [];
   let unmaximized = 0;
   const primary = {getTitle: () => 'Granola', unmaximize() { unmaximized++; }, setBounds(...args) {
@@ -1090,7 +1112,7 @@ function setup(command) {
   unsubscribe();
   await tick();
   assert(stopTimer && updates.length === 1, 'unsubscribe left detection active');
-  console.log('Linux runtime: tiled geometry, floating window APIs, PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
+  console.log('Linux runtime: startup links, tiled geometry, floating window APIs, PCM framing, both sources, stop/race cleanup, errors, device changes, meeting detection and unsubscribe passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 EOF
 )
