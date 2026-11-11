@@ -79,18 +79,22 @@ Wayland.
 
 Some things are different from the macOS build:
 
-- Meeting capture uses two PulseAudio PCM streams (including PipeWire's
-  PulseAudio compatibility service): the default microphone and the default
-  output's monitor. Both feed the app's existing transcription pipeline.
+- Meeting capture uses PulseAudio PCM streams (including PipeWire's PulseAudio
+  compatibility service). Auto microphone selection follows the meeting app's
+  actual input, even when the system default is different. A manual microphone
+  selection in Granola takes precedence. Browser device IDs are resolved to
+  Pulse source names rather than passed to the recorder as hashes.
+  System audio follows application playback streams across outputs, including
+  device changes made inside a meeting app. Multiple playback streams are mixed
+  into Granola's existing system-audio channel; this does not create separate
+  notes for simultaneous calls. Per-stream capture excludes virtual routing
+  loopbacks, avoiding duplicate audio through a virtual and physical sink.
+  With no application playback streams it falls back to the default output.
   Install `pactl` and `parec` from your distribution's PulseAudio tools package.
-  Capture starts only when Granola requests a recording, stops both streams
-  when it ends, and follows default device changes while recording. Use
-  `GRANOLA_LINUX_MIC_SOURCE` or `GRANOLA_LINUX_SYSTEM_SOURCE` to select explicit
-  PulseAudio source names. This avoids Electron's Windows-only loopback path.
-  The meeting prompt can pin a browser device ID. The adapter maps that ID's
-  label to a PulseAudio source, or follows the active meeting application's
-  microphone when labels are unavailable in the background. An unknown browser
-  hash is never passed to the recorder as a source name.
+  Capture starts only when Granola requests transcription. Stop terminates
+  every microphone/playback recorder and the mixer. Routing is checked every
+  half second. `GRANOLA_LINUX_MIC_SOURCE` and `GRANOLA_LINUX_SYSTEM_SOURCE` select
+  explicit sources for diagnosis and override automatic device following.
 - Meeting detection observes active microphone streams and recognizes common
   browsers (including Helium), Zoom, Teams, Slack, and Discord. It publishes
   meeting evidence to Granola's observer; it does not itself start recordings.

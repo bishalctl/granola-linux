@@ -592,27 +592,27 @@ function execute(command, args) {
     (error, stdout) => error ? reject(error) : resolve(stdout.trim())));
 }
 
-// The app pins WebRTC device hashes when a meeting is detected. Those hashes
-// are not PulseAudio source names: passing one to parec drops the microphone.
-// Resolve browser labels to Pulse sources; if labels are unavailable while the
-// app is hidden, follow the active meeting app's actual microphone, then the
-// current default. Explicit Pulse source overrides always take precedence.
+// A meeting may select a different microphone without changing the system
+// default. Auto follows the app's actual input; a manually selected Granola
+// microphone or explicit source override keeps precedence. Browser device IDs
+// must be resolved to Pulse sources rather than passed to parec as hashes.
 async function resolveMicrophone(input, {command = execute, env = process.env,
     devices = readMediaInputs} = {}) {
   if (env.GRANOLA_LINUX_MIC_SOURCE) return env.GRANOLA_LINUX_MIC_SOURCE;
-  const fallback = () => command('pactl', ['get-default-source']);
-  if (input == null || ['default', 'communications'].includes(String(input))) return fallback();
   const sources = JSON.parse(await command('pactl', ['--format=json', 'list', 'sources']));
-  const id = String(input).replace(/^pulse:/, '');
-  const direct = sources.find(source => source.name === id || String(source.index) === id);
-  if (direct) return direct.name;
-  const normalize = label => String(label || '').replace(/^(default|communications)\s*-\s*/i, '').trim().toLowerCase();
-  const media = await devices();
-  const label = normalize(media.find(device => device.deviceId === input)?.label);
-  if (label) {
-    const matches = sources.filter(source => [source.description, source.properties?.['device.description']]
-      .some(description => normalize(description) === label));
-    if (matches.length === 1) return matches[0].name;
+  const auto = input == null || ['default', 'communications'].includes(String(input));
+  if (!auto) {
+    const id = String(input).replace(/^pulse:/, '');
+    const direct = sources.find(source => source.name === id || String(source.index) === id);
+    if (direct) return direct.name;
+    const normalize = label => String(label || '').replace(/^(default|communications)\s*-\s*/i, '').trim().toLowerCase();
+    const media = await devices();
+    const label = normalize(media.find(device => device.deviceId === input)?.label);
+    if (label) {
+      const matches = sources.filter(source => [source.description, source.properties?.['device.description']]
+        .some(description => normalize(description) === label));
+      if (matches.length === 1) return matches[0].name;
+    }
   }
   const apps = parseMeetingApps(JSON.parse(await command('pactl', ['--format=json', 'list', 'source-outputs'])));
   for (const app of apps) {
@@ -620,57 +620,101 @@ async function resolveMicrophone(input, {command = execute, env = process.env,
     const source = sources.find(source => String(source.index) === index);
     if (source) return source.name;
   }
-  return fallback();
+  return command('pactl', ['get-default-source']);
+}
+
+// Watching only the default output loses calls routed by the meeting app to a
+// different device. Record each application playback stream at its actual sink
+// and mix them into Granola's one system channel. Per-stream monitors avoid
+// duplicating sound through virtual-sink loopbacks (e.g. virtual -> HDMI).
+async function resolveSystemStreams({command = execute, env = process.env} = {}) {
+  if (env.GRANOLA_LINUX_SYSTEM_SOURCE) return [{key: 'system', device: env.GRANOLA_LINUX_SYSTEM_SOURCE}];
+  const [sinks, inputs] = await Promise.all(['sinks', 'sink-inputs'].map(kind =>
+    command('pactl', ['--format=json', 'list', kind]).then(JSON.parse)));
+  const result = [];
+  for (const input of inputs) {
+    const p = input.properties || {};
+    if (input.corked || !Number.isInteger(input.index) ||
+        p['application.id'] === 'com.granola.app' || p['application.process.binary'] === 'granola' ||
+        String(p['node.virtual']) === 'true' ||
+        !(p['application.process.binary'] || p['application.process.id'] || p['application.id'])) continue;
+    const sink = sinks.find(sink => String(sink.index) === String(input.sink));
+    if (!sink) continue;
+    const device = typeof sink.monitor_source === 'string' ? sink.monitor_source :
+      sink.monitor_source_name || `${sink.name}.monitor`;
+    result.push({key: `system:${input.index}`, device, monitor: input.index});
+  }
+  if (result.length) return result;
+  return [{key: 'system', device: `${await command('pactl', ['get-default-sink'])}.monitor`}];
+}
+
+function mixPcm(buffers, bytes) {
+  const mixed = Buffer.alloc(bytes);
+  for (let offset = 0; offset < bytes; offset += 2) {
+    let sample = 0;
+    for (const buffer of buffers) if (offset + 1 < buffer.length) sample += buffer.readInt16LE(offset);
+    mixed.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), offset);
+  }
+  return mixed;
 }
 
 function createCapture({emit, launch = spawn, command = execute, env = process.env,
                         devices = readMediaInputs, every = setInterval, cancel = clearInterval} = {}) {
-  let epoch = 0, active = false, rate = 16000, poll, polling = false, input;
+  let epoch = 0, active = false, rate = 16000, poll, mixer, polling = false, input;
+  let microphoneVolume = 0;
   const streams = new Map();
-  const defaults = {};
-  const selected = async kind => kind === 'microphone'
-    ? resolveMicrophone(input, {command, env, devices})
-    : env.GRANOLA_LINUX_SYSTEM_SOURCE || `${await command('pactl', ['get-default-sink'])}.monitor`;
-  const log = (level, event, payload) => emit({event: 'log-to-backend', level,
-    logEvent: event, payload});
-  function close(kind) {
-    const stream = streams.get(kind);
-    streams.delete(kind); // invalidate callbacks before terminating the child
+  const selected = () => Promise.all([
+    resolveMicrophone(input, {command, env, devices}).then(device => ({key: 'microphone', device})),
+    resolveSystemStreams({command, env}),
+  ]).then(([mic, system]) => [mic, ...system]);
+  const log = (level, event, payload) => emit({event: 'log-to-backend', level, logEvent: event, payload});
+  const frameBytes = () => Math.round(rate / 10) * 2;
+  function send(kind, buffer) {
+    emit({event: 'audio-capture-buffer', microphoneBuffer: kind === 'microphone' ? buffer : null,
+      systemAudioBuffer: kind === 'system' ? buffer : null});
+    let energy = 0;
+    for (let i = 0; i < buffer.length; i += 2) energy += (buffer.readInt16LE(i) / 32768) ** 2;
+    const volume = Math.sqrt(energy / (buffer.length / 2));
+    if (kind === 'microphone') microphoneVolume = volume;
+    else emit({event: 'audio-volume', microphone: microphoneVolume, system: volume});
+  }
+  function close(key) {
+    const stream = streams.get(key);
+    streams.delete(key); // Invalidate callbacks before terminating the child.
     if (stream) stream.process.kill('SIGTERM');
   }
   function stop() {
     epoch++;
     active = false;
     if (poll) cancel(poll);
-    poll = undefined;
-    for (const kind of [...streams.keys()]) close(kind);
+    if (mixer) cancel(mixer);
+    poll = mixer = undefined;
+    for (const key of [...streams.keys()]) close(key);
   }
-  function open(kind, device, generation) {
-    close(kind);
-    const child = launch('parec', ['--raw', '--format=s16le', `--rate=${rate}`,
-      '--channels=1', '--latency-msec=100', `--device=${device}`,
-      '--client-name=Granola', '--stream-name=Granola meeting capture',
-      '--property=application.id=com.granola.app'], {stdio: ['ignore', 'pipe', 'pipe']});
-    const stream = {process: child, pending: Buffer.alloc(0), failed: false};
-    streams.set(kind, stream);
-    defaults[kind] = device;
-    const current = () => active && generation === epoch && streams.get(kind) === stream;
-    const frameBytes = Math.round(rate / 10) * 2; // mono signed 16-bit, 100 ms
+  function open(selection, generation) {
+    const {key, device, monitor} = selection;
+    close(key);
+    const args = ['--raw', '--format=s16le', `--rate=${rate}`, '--channels=1', '--latency-msec=100',
+      `--device=${device}`, '--client-name=Granola', '--stream-name=Granola meeting capture',
+      '--property=application.id=com.granola.app'];
+    if (monitor !== undefined) args.push(`--monitor-stream=${monitor}`);
+    const child = launch('parec', args, {stdio: ['ignore', 'pipe', 'pipe']});
+    const stream = {...selection, process: child, pending: Buffer.alloc(0), failed: false};
+    streams.set(key, stream);
+    const current = () => active && generation === epoch && streams.get(key) === stream;
     child.stdout.on('data', data => {
       if (!current()) return;
       stream.pending = Buffer.concat([stream.pending, data]);
-      while (current() && stream.pending.length >= frameBytes) {
-        const buffer = Buffer.from(stream.pending.subarray(0, frameBytes));
-        stream.pending = stream.pending.subarray(frameBytes);
-        emit({event: 'audio-capture-buffer',
-          microphoneBuffer: kind === 'microphone' ? buffer : null,
-          systemAudioBuffer: kind === 'system' ? buffer : null});
-        let energy = 0;
-        for (let i = 0; i < buffer.length; i += 2) energy += (buffer.readInt16LE(i) / 32768) ** 2;
-        stream.volume = Math.sqrt(energy / (buffer.length / 2));
-        emit({event: 'audio-volume',
-          microphone: streams.get('microphone')?.volume || 0,
-          system: streams.get('system')?.volume || 0});
+      if (key === 'microphone') {
+        while (current() && stream.pending.length >= frameBytes()) {
+          const buffer = Buffer.from(stream.pending.subarray(0, frameBytes()));
+          stream.pending = stream.pending.subarray(frameBytes());
+          send('microphone', buffer);
+        }
+      } else if (stream.pending.length > frameBytes() * 5) {
+        // Bound latency/memory after a stalled event loop; keep sample alignment.
+        const skipped = Math.floor((stream.pending.length - frameBytes() * 5) / frameBytes()) * frameBytes();
+        stream.pending = stream.pending.subarray(skipped);
       }
     });
     let diagnostic = '';
@@ -678,21 +722,32 @@ function createCapture({emit, launch = spawn, command = execute, env = process.e
     const failed = reason => {
       if (!current() || stream.failed) return;
       stream.failed = true;
+      const kind = key === 'microphone' ? 'microphone' : 'system';
       log('error', 'linux-audio-source-error', {source: kind, reason: String(reason), diagnostic});
       emit({event: 'audio-capture-source-error', source: kind});
     };
     child.on('error', failed);
-    child.on('exit', (code, signal) => failed(`parec exited ${code ?? signal}`));
+    child.on('exit', (code, signal) => {
+      // Playback streams normally disappear when a tab stops playing. The
+      // next device query removes them; this is not a failed microphone.
+      if (monitor !== undefined && current()) { stream.failed = true; return; }
+      failed(`parec exited ${code ?? signal}`);
+    });
+  }
+  function reconcile(selections, generation) {
+    const wanted = new Set(selections.map(item => item.key));
+    for (const key of [...streams.keys()]) if (!wanted.has(key)) close(key);
+    for (const selection of selections) {
+      const old = streams.get(selection.key);
+      if (!old || old.device !== selection.device || old.failed) open(selection, generation);
+    }
   }
   async function refresh(generation) {
     if (!active || polling) return;
     polling = true;
     try {
-      const devices = await Promise.all(['microphone', 'system'].map(selected));
-      if (!active || epoch !== generation) return;
-      for (const [i, kind] of ['microphone', 'system'].entries()) {
-        if (devices[i] !== defaults[kind] || !streams.has(kind)) open(kind, devices[i], generation);
-      }
+      const selections = await selected();
+      if (active && epoch === generation) reconcile(selections, generation);
     } catch (error) {
       if (active && epoch === generation) log('warn', 'linux-audio-device-query-failed', {error: error.message});
     } finally { polling = false; }
@@ -704,12 +759,24 @@ function createCapture({emit, launch = spawn, command = execute, env = process.e
     active = true;
     const generation = epoch;
     try {
-      const devices = await Promise.all(['microphone', 'system'].map(selected));
+      const selections = await selected();
       if (!active || epoch !== generation) return;
-      open('microphone', devices[0], generation);
-      open('system', devices[1], generation);
-      poll = every(() => refresh(generation), 1500);
-      poll?.unref?.();
+      reconcile(selections, generation);
+      poll = every(() => refresh(generation), 500);
+      mixer = every(() => {
+        if (!active || epoch !== generation) return;
+        const buffers = [];
+        for (const [key, stream] of streams) {
+          if (key === 'microphone') continue;
+          // An underrunning/stopped app contributes silence; it cannot stall
+          // other outputs or cause their audio to be concatenated in time.
+          const bytes = stream.pending.length >= frameBytes() ? frameBytes() : 0;
+          buffers.push(stream.pending.subarray(0, bytes));
+          stream.pending = stream.pending.subarray(bytes);
+        }
+        send('system', mixPcm(buffers, frameBytes()));
+      }, 100);
+      poll?.unref?.(); mixer?.unref?.();
       log('info', 'linux-audio-capture-started', {sampleRate: rate});
     } catch (error) {
       if (active && epoch === generation) {
@@ -726,16 +793,13 @@ function createCapture({emit, launch = spawn, command = execute, env = process.e
         case 'start-audio-capture': return start(message.sampleRate);
         case 'stop-audio-capture': return stop();
         case 'reacquire-system-audio':
-          if (active) { close('system'); await refresh(epoch); }
+          if (active) {
+            for (const key of [...streams.keys()]) if (key !== 'microphone') close(key);
+            await refresh(epoch);
+          }
           return;
-        case 'set-input-device':
-          input = message.deviceId;
-          if (active) await refresh(epoch);
-          return;
-        case 'unpin-input-device':
-          input = undefined;
-          if (active) await refresh(epoch);
-          return;
+        case 'set-input-device': input = message.deviceId; if (active) await refresh(epoch); return;
+        case 'unpin-input-device': input = undefined; if (active) await refresh(epoch); return;
         default: return;
       }
     },
@@ -801,7 +865,7 @@ async function microphonePermission(callback) {
   try { await execute('pactl', ['info']); callback(true); }
   catch { callback(false); }
 }
-module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow, handleStartupLink, resolveMicrophone};
+module.exports = {createCapture, parseMeetingApps, subscribeMeetings, handle, microphonePermission, managePrimaryWindow, handleStartupLink, resolveMicrophone, resolveSystemStreams, mixPcm};
 EOF
 }
 
@@ -1031,13 +1095,22 @@ cmd_check_runtime() (
   node - "$test_dir/runtime.cjs" <<'EOF'
 const assert = require('node:assert/strict');
 const {EventEmitter} = require('node:events');
-const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow, handleStartupLink, resolveMicrophone} = require(process.argv[2]);
+const {createCapture, parseMeetingApps, subscribeMeetings, managePrimaryWindow, handleStartupLink, resolveMicrophone, resolveSystemStreams, mixPcm} = require(process.argv[2]);
 const flush = () => new Promise(resolve => setImmediate(resolve));
+function audioCommand({sources = [], outputs = [], sinks = [], inputs = [], mic = 'mic', sink = 'speaker'} = {}) {
+  return async (_binary, args) => {
+    if (args[0] === 'get-default-source') return typeof mic === 'function' ? mic() : mic;
+    if (args[0] === 'get-default-sink') return typeof sink === 'function' ? sink() : sink;
+    const values = {sources, 'source-outputs': outputs, sinks, 'sink-inputs': inputs}[args.at(-1)];
+    assert.notEqual(values, undefined, `Unexpected audio query: ${args}`);
+    return JSON.stringify(typeof values === 'function' ? values() : values);
+  };
+}
 function setup(command) {
   const children = [], events = [], timers = [];
   let cancelled = 0;
   const capture = createCapture({emit: event => events.push(event), env: {},
-    command: command || (async (_command, args) => args[0] === 'get-default-source' ? 'mic' : 'speaker'),
+    command: command || audioCommand(),
     launch(binary, args) {
       assert.equal(binary, 'parec');
       assert(args.includes('--format=s16le') && args.includes('--channels=1'));
@@ -1071,23 +1144,74 @@ function setup(command) {
   browserOutputs = [];
   assert.equal(await resolveMicrophone('unavailable-hash', resolver), 'mic-a');
   assert.equal(await resolveMicrophone('default', resolver), 'mic-a');
+  browserOutputs = [{source: 7, properties: {'application.process.binary': 'helium'}}];
+  assert.equal(await resolveMicrophone(undefined, resolver), 'mic-b', 'Auto ignored the meeting microphone');
+  assert.equal(await resolveMicrophone('communications', resolver), 'mic-b');
   assert.equal(await resolveMicrophone('opaque-web-hash', {...resolver, env: {GRANOLA_LINUX_MIC_SOURCE: 'override'}}), 'override');
-  const pinned = setup(async (_binary, args) => {
-    if (args[0] === 'get-default-source') return 'mic-a';
-    if (args[0] === 'get-default-sink') return 'speaker';
-    return JSON.stringify(args.at(-1) === 'sources' ? sourceRows : [
-      {source: 7, properties: {'application.process.binary': 'helium'}}]);
-  });
+  const pinned = setup(audioCommand({sources: sourceRows, outputs: () => browserOutputs}));
   await pinned.capture.start(16000);
-  await pinned.capture.handle({event: 'set-input-device', deviceId: 'browser-device-hash'});
+  assert(pinned.children[0].args.includes('--device=mic-b'));
+  await pinned.capture.handle({event: 'set-input-device', deviceId: 'mic-a'});
   assert(pinned.children[0].killed);
   assert(!pinned.children[1].killed, 'microphone selection restarted system audio');
-  assert(pinned.children[2].args.includes('--device=mic-b'));
+  assert(pinned.children[2].args.includes('--device=mic-a'));
   await pinned.capture.handle({event: 'unpin-input-device'});
   assert(pinned.children[2].killed);
-  assert(pinned.children[3].args.includes('--device=mic-a'));
+  assert(pinned.children[3].args.includes('--device=mic-b'));
+  browserOutputs = [{source: 0, properties: {'application.process.binary': 'helium'}}];
+  await pinned.timers[0]();
+  assert(pinned.children[3].killed);
+  assert(pinned.children[4].args.includes('--device=mic-a'), 'meeting input switch was not followed');
   pinned.capture.stop();
   assert(pinned.children.every(child => child.killed));
+  const sinks = [{index: 1, name: 'speaker-a', monitor_source: 'a.monitor'},
+    {index: 2, name: 'speaker-b', monitor_source: 'b.monitor'}];
+  const playback = (index, sink, properties = {}) => ({index, sink, properties: {
+    'application.process.binary': 'helium', ...properties}});
+  let inputs = [playback(10, 2), playback(11, 1),
+    playback(12, 1, {'node.virtual': 'true'}),
+    playback(13, 1, {'application.id': 'com.granola.app'}),
+    {...playback(14, 1), corked: true}];
+  const route = audioCommand({sinks, inputs: () => inputs});
+  assert.deepEqual(await resolveSystemStreams({command: route, env: {}}), [
+    {key: 'system:10', device: 'b.monitor', monitor: 10},
+    {key: 'system:11', device: 'a.monitor', monitor: 11}]);
+  const multi = setup(route);
+  await multi.capture.start(16000);
+  assert.equal(multi.children.length, 3, 'two outputs were not opened');
+  assert(multi.children[1].args.includes('--monitor-stream=10'));
+  assert(multi.children[1].args.includes('--device=b.monitor'));
+  const pcm = n => {const b = Buffer.alloc(3200);for (let i=0;i<b.length;i+=2)b.writeInt16LE(n,i);return b;};
+  multi.children[1].stdout.emit('data', pcm(1000));
+  multi.children[2].stdout.emit('data', pcm(2000));
+  multi.timers[1]();
+  let mixed = multi.events.filter(e => e.event === 'audio-capture-buffer').at(-1).systemAudioBuffer;
+  assert.equal(mixed.length, 3200);
+  assert.equal(mixed.readInt16LE(0), 3000, 'two outputs were concatenated instead of mixed');
+  multi.children[2].stdout.emit('data', pcm(2000));
+  multi.timers[1]();
+  mixed = multi.events.filter(e => e.event === 'audio-capture-buffer').at(-1).systemAudioBuffer;
+  assert.equal(mixed.readInt16LE(0), 2000, 'a silent output stalled the other output');
+  assert.equal(mixPcm([pcm(30000), pcm(30000)], 3200).readInt16LE(0), 32767);
+  assert.equal(mixPcm([pcm(-30000), pcm(-30000)], 3200).readInt16LE(0), -32768);
+  inputs = [playback(10, 1)];
+  await multi.timers[0]();
+  assert(multi.children[1].killed && multi.children[2].killed);
+  assert(multi.children[3].args.includes('--device=a.monitor'), 'in-app output change was ignored');
+  assert(!multi.children[0].killed, 'output routing restarted the microphone');
+  multi.children[3].emit('exit', 0);
+  assert.equal(multi.events.filter(e => e.event === 'audio-capture-source-error').length, 0,
+    'normal playback end was reported as a recording error');
+  inputs = [];
+  await multi.timers[0]();
+  assert(multi.children[4].args.includes('--device=speaker.monitor'), 'no playback fallback missing');
+  multi.capture.stop();
+  assert(multi.children.every(child => child.killed));
+  const eventCount = multi.events.length;
+  multi.timers[1]();
+  assert.equal(multi.events.length, eventCount, 'mixer emitted after Stop');
+  assert.deepEqual(await resolveSystemStreams({command: route,
+    env: {GRANOLA_LINUX_SYSTEM_SOURCE: 'explicit.monitor'}}), [{key: 'system', device: 'explicit.monitor'}]);
   const opened = [], seen = new Set();
   const startup = {platform: 'linux', parse: args => args.find(x => x.startsWith('granola://')),
     accept: url => { if (seen.has(url)) return false; seen.add(url); return true; }, open: url => opened.push(url)};
@@ -1140,6 +1264,7 @@ function setup(command) {
   t.children[0].stdout.emit('data', Buffer.alloc(1111));
   t.children[0].stdout.emit('data', Buffer.alloc(5289));
   t.children[1].stdout.emit('data', Buffer.alloc(3200));
+  t.timers[1]();
   const buffers = t.events.filter(e => e.event === 'audio-capture-buffer');
   assert.equal(buffers.length, 3, 'PCM fragments were lost or combined across sources');
   assert.equal(buffers[0].microphoneBuffer.length, 3200);
@@ -1148,7 +1273,7 @@ function setup(command) {
   assert.equal(buffers[2].systemAudioBuffer.length, 3200);
   t.capture.stop();
   assert(t.children.every(child => child.killed));
-  assert.equal(t.cancelled, 1);
+  assert.equal(t.cancelled, 2);
   const count = t.events.length;
   t.children[0].stdout.emit('data', Buffer.alloc(3200));
   assert.equal(t.events.length, count, 'stopped capture emitted late audio');
@@ -1159,7 +1284,7 @@ function setup(command) {
   t.capture.stop();
 
   let sink = 'before';
-  const switched = setup(async (_binary, args) => args[0] === 'get-default-source' ? 'mic' : sink);
+  const switched = setup(audioCommand({sink: () => sink}));
   await switched.capture.start(16000);
   sink = 'after';
   await switched.timers[0]();
@@ -1173,11 +1298,12 @@ function setup(command) {
   // Use fixed system source so only one asynchronous query is pending.
   const lateChildren = [];
   const late = createCapture({emit() {}, env: {GRANOLA_LINUX_SYSTEM_SOURCE: 'test.monitor'},
-    command: () => new Promise(resolve => { resolveDevice = resolve; }),
+    command: async (_binary, args) => args.at(-1) === 'sources' ?
+      new Promise(resolve => { resolveDevice = () => resolve('[]'); }) : 'mic',
     launch() { lateChildren.push('unexpected'); throw Error('late recorder started'); }});
   const starting = late.start(16000);
   late.stop();
-  resolveDevice('mic');
+  resolveDevice();
   await starting;
   assert.deepEqual(lateChildren, [], 'stop during device discovery activated recording');
   assert(!late.active);
